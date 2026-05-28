@@ -1,15 +1,19 @@
 """
 /gossip текст сплетни
 
-- Сообщение пользователя удаляется из чата
-- Сплетня сохраняется в БД анонимно
-- При генерации summary вчерашние сплетни вплетаются в текст
+— Только в группах
+— Сообщение удаляется немедленно (анонимность)
+— Gemini перефразирует, чтобы стиль не выдал автора
+— Попадает в ближайшую авто-сводку
 """
 
 import logging
+
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.error import BadRequest
+from telegram.constants import ChatType
+
 from utils.db import save_gossip
 from services.gemini import process_gossip
 
@@ -21,25 +25,31 @@ async def cmd_gossip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # Удаляем сообщение немедленно — анонимность прежде всего
+    # Только группы
+    if msg.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        # В личке — тихо игнорируем, не отвечаем
+        return
+
+    # Удаляем сразу
     try:
         await msg.delete()
     except BadRequest:
         pass
 
     raw = " ".join(context.args).strip() if context.args else ""
-    if not raw or len(raw) < 5:
-        # Тихо не отвечаем — чтобы не было видно что человек пытался отправить сплетню
+    if len(raw) < 5:
+        # Тихо — не хотим выдавать что кто-то пытался написать сплетню
         return
 
     if len(raw) > 1000:
         raw = raw[:1000]
 
-    # Перефразируем через Gemini чтобы стиль автора не выдал его
     try:
         processed = await process_gossip(raw)
+        if not processed or len(processed.strip()) < 3:
+            processed = raw  # фоллбэк
     except Exception:
-        processed = raw  # фоллбэк — сохраняем как есть
+        processed = raw
 
-    await save_gossip(chat_id=msg.chat_id, gossip_text=processed)
+    await save_gossip(chat_id=msg.chat_id, gossip_text=processed.strip())
     logger.info(f"Gossip saved for chat {msg.chat_id}")

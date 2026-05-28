@@ -1,6 +1,7 @@
 import os
 import asyncpg
 import logging
+import datetime as dt
 
 logger = logging.getLogger(__name__)
 _pool = None
@@ -68,7 +69,6 @@ async def init_db():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        # Анонимные сообщения (удаляются через 24ч)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS anon_messages (
                 id SERIAL PRIMARY KEY,
@@ -80,7 +80,6 @@ async def init_db():
                 expires_at TIMESTAMPTZ NOT NULL
             );
         """)
-        # Сплетни (привязаны к дате, анонимны)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS gossips (
                 id SERIAL PRIMARY KEY,
@@ -90,7 +89,6 @@ async def init_db():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        # Настройки авто-сводки по чату
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_settings (
                 chat_id BIGINT PRIMARY KEY,
@@ -101,7 +99,7 @@ async def init_db():
         """)
     logger.info("Tables ensured")
 
-# ─── Birthdays ───────────────────────────────────────────────────────────────
+# ─── Birthdays ────────────────────────────────────────────────────────────────
 
 async def save_birthday(user_id, username, first_name, day, month, chat_id):
     pool = await get_pool()
@@ -124,9 +122,10 @@ async def get_todays_birthdays(day, month):
 async def update_birthday_profile(user_id, profile):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE birthdays SET user_profile=$2 WHERE user_id=$1", user_id, profile)
+        await conn.execute(
+            "UPDATE birthdays SET user_profile=$2 WHERE user_id=$1", user_id, profile)
 
-# ─── Message log ─────────────────────────────────────────────────────────────
+# ─── Message log ──────────────────────────────────────────────────────────────
 
 async def log_message(chat_id, user_id, username, first_name, msg_type, content):
     pool = await get_pool()
@@ -143,12 +142,12 @@ async def get_yesterday_messages(chat_id):
             SELECT username, first_name, msg_type, content, logged_at
             FROM message_log
             WHERE chat_id=$1
-              AND logged_at::date = (NOW() AT TIME ZONE 'Europe/Madrid')::date - INTERVAL '1 day'
+              AND logged_at::date =
+                  (NOW() AT TIME ZONE 'Europe/Madrid')::date - INTERVAL '1 day'
             ORDER BY logged_at
         """, chat_id)
 
 async def get_user_messages(chat_id, user_id, limit=200):
-    """Получить последние сообщения конкретного пользователя для характеристики."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         return await conn.fetch("""
@@ -165,7 +164,7 @@ async def cleanup_old_messages(chat_id):
             "DELETE FROM message_log WHERE chat_id=$1 AND logged_at < NOW() - INTERVAL '2 days'",
             chat_id)
 
-# ─── Summary log ─────────────────────────────────────────────────────────────
+# ─── Summary log ──────────────────────────────────────────────────────────────
 
 async def check_summary_used(chat_id):
     pool = await get_pool()
@@ -219,15 +218,14 @@ async def get_user_profile(user_id):
         return (row["profile_notes"] or "") if row else ""
 
 async def get_user_by_username(chat_id, username):
-    """Найти user_id по username в профилях."""
+    """username — уже без @ и в нижнем регистре."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        username_clean = username.lstrip("@").lower()
         return await conn.fetchrow("""
             SELECT user_id, first_name, username, message_count
             FROM user_profiles
-            WHERE chat_id=$1 AND LOWER(username)=$2
-        """, chat_id, username_clean)
+            WHERE chat_id=$1 AND LOWER(COALESCE(username,''))=$2
+        """, chat_id, username)
 
 # ─── Useful links ─────────────────────────────────────────────────────────────
 
@@ -235,7 +233,8 @@ async def add_link(chat_id, title, url, tag, description, added_by_id, added_by_
     pool = await get_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval("""
-            INSERT INTO useful_links (chat_id, title, url, tag, description, added_by_id, added_by_name)
+            INSERT INTO useful_links
+                (chat_id, title, url, tag, description, added_by_id, added_by_name)
             VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id
         """, chat_id, title, url, tag, description, added_by_id, added_by_name)
 
@@ -260,7 +259,7 @@ async def delete_link(chat_id, link_id):
         await conn.execute(
             "DELETE FROM useful_links WHERE chat_id=$1 AND id=$2", chat_id, link_id)
 
-# ─── Anon messages ───────────────────────────────────────────────────────────
+# ─── Anon messages ────────────────────────────────────────────────────────────
 
 async def save_anon_message(chat_id, sender_id, recipient_usernames, message_text):
     pool = await get_pool()
@@ -284,22 +283,18 @@ async def get_anon_message(msg_id):
 async def cleanup_expired_anon_messages():
     pool = await get_pool()
     async with pool.acquire() as conn:
-        deleted = await conn.fetchval(
-            "DELETE FROM anon_messages WHERE expires_at <= NOW() RETURNING id")
-        return deleted
+        await conn.execute("DELETE FROM anon_messages WHERE expires_at <= NOW()")
 
-# ─── Gossips ─────────────────────────────────────────────────────────────────
+# ─── Gossips ──────────────────────────────────────────────────────────────────
 
 async def save_gossip(chat_id, gossip_text):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO gossips (chat_id, gossip_text)
-            VALUES ($1,$2)
-        """, chat_id, gossip_text)
+        await conn.execute(
+            "INSERT INTO gossips (chat_id, gossip_text) VALUES ($1,$2)",
+            chat_id, gossip_text)
 
 async def get_yesterdays_gossips(chat_id):
-    """Сплетни, добавленные вчера (по мадридскому времени)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         return await conn.fetch("""
@@ -315,40 +310,39 @@ async def cleanup_old_gossips():
         await conn.execute(
             "DELETE FROM gossips WHERE created_at < NOW() - INTERVAL '3 days'")
 
-# ─── Chat settings ───────────────────────────────────────────────────────────
+# ─── Chat settings ────────────────────────────────────────────────────────────
 
 async def get_auto_summary(chat_id):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT auto_summary FROM chat_settings WHERE chat_id=$1", chat_id)
-        return row["auto_summary"] if row else True  # по умолчанию включено
+        return row["auto_summary"] if row else True
 
 async def toggle_auto_summary(chat_id):
-    """Переключить авто-сводку. Возвращает новое состояние (True/False).
-    Защита: не более 10 переключений в сутки."""
+    """Переключить авто-сводку. None = лимит переключений превышен."""
     pool = await get_pool()
+    now_utc = dt.datetime.now(dt.timezone.utc)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT auto_summary, summary_toggle_count, last_toggle_at FROM chat_settings WHERE chat_id=$1",
-            chat_id)
+            "SELECT auto_summary, summary_toggle_count, last_toggle_at "
+            "FROM chat_settings WHERE chat_id=$1", chat_id)
         if row is None:
-            # первый раз — выключаем (изначально включено по умолчанию=True)
             await conn.execute("""
-                INSERT INTO chat_settings (chat_id, auto_summary, summary_toggle_count, last_toggle_at)
+                INSERT INTO chat_settings
+                    (chat_id, auto_summary, summary_toggle_count, last_toggle_at)
                 VALUES ($1, FALSE, 1, NOW())
             """, chat_id)
             return False
-        # Сброс счётчика если прошли сутки
-        import datetime
+
         last = row["last_toggle_at"]
-        now_utc = __import__('datetime').datetime.utcnow().replace(tzinfo=__import__('datetime').timezone.utc)
-        if (now_utc - last).total_seconds() > 86400:
-            count = 0
-        else:
-            count = row["summary_toggle_count"] or 0
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=dt.timezone.utc)
+        count = 0 if (now_utc - last).total_seconds() > 86400 \
+                  else (row["summary_toggle_count"] or 0)
         if count >= 10:
-            return None  # лимит переключений
+            return None
+
         new_val = not row["auto_summary"]
         await conn.execute("""
             UPDATE chat_settings
