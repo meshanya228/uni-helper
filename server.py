@@ -52,8 +52,10 @@ async def start_http_server():
     app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", 7860).start()
-    logger.info("HTTP server started on :7860")
+    port = int(os.environ.get("PORT", 7860))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logger.info(f"HTTP server started on :{port}")
+    logger.info(f"HTTP server started on :{port}")
 
 
 # ─── Self-pinger ───────────────────────────────────────────────────────────────
@@ -68,7 +70,8 @@ async def self_ping():
     base = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not base:
         # Не на Render — пингуем локально
-        base = "http://localhost:7860"
+        port = int(os.environ.get("PORT", 7860))
+        base = f"http://localhost:{port}"
     url = f"{base}/health"
     try:
         timeout = ClientTimeout(total=15)
