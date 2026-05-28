@@ -23,7 +23,7 @@ from handlers.gossip   import cmd_gossip
 from handlers.map_cmd  import cmd_map
 from utils.db          import (init_db, cleanup_expired_anon_messages,
                                 cleanup_old_gossips)
-from services.gemini   import ensure_bg_worker
+from services.gemini   import ensure_bg_worker, check_api_health
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -151,6 +151,10 @@ async def main():
     await start_http_server()
     await init_db()
     ensure_bg_worker()
+
+    # Проверяем Gemini API при старте
+    api_status = await check_api_health()
+    logger.info(f"Gemini API status: {api_status}")
 
     app = await build_application()
 

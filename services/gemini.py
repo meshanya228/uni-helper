@@ -14,7 +14,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL   = "gemini-2.0-flash"
+GEMINI_MODEL   = "gemini-1.5-flash-latest"
 GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 MADRID_TZ      = ZoneInfo("Europe/Madrid")
 
@@ -125,6 +125,31 @@ def ensure_bg_worker():
         asyncio.get_event_loop().create_task(_bg_worker())
         _bg_worker_started = True
 
+
+
+async def check_api_health() -> str:
+    """Проверка доступности API - вызывается при старте."""
+    if not GEMINI_API_KEY:
+        return "❌ GEMINI_API_KEY не задан"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generationConfig": {"maxOutputTokens": 5},
+    }
+    try:
+        data = await _raw_request(payload, timeout=15)
+        text = _extract_text(data)
+        return f"✅ Gemini API работает (модель: {GEMINI_MODEL})"
+    except RateLimitError as e:
+        return f"⚠️ Rate limit активен до {datetime.fromtimestamp(e.reset_at, tz=MADRID_TZ).strftime('%H:%M')}"
+    except Exception as e:
+        return f"❌ Gemini API ошибка: {e}"
+
+
+def reset_rate_limit():
+    """Сбросить rate limit вручную."""
+    global _rate_limit_reset
+    _rate_limit_reset = 0.0
+    logger.info("Rate limit reset manually")
 
 def _build_payload(prompt: str, system: str = SYSTEM_PROMPT,
                    temp: float = 0.9, tokens: int = 1024,
