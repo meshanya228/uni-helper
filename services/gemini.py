@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Awaitable
 from zoneinfo import ZoneInfo
@@ -18,7 +18,7 @@ GEMINI_MODEL   = "gemini-2.5-flash-preview-05-20"
 GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 MADRID_TZ      = ZoneInfo("Europe/Madrid")
 
-# Safety settings — всё отключено легально
+# Safety — всё отключено
 SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_HATE_SPEECH",       "threshold": "BLOCK_NONE"},
@@ -26,34 +26,32 @@ SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
 ]
 
-SYSTEM_PROMPT = """Ты — UniHelper, бот в закрытом Telegram-чате «UAшники» — русскоязычные студенты Университета Аликанте. Примерно 100 человек, все свои.
+SYSTEM_PROMPT = """Ты — UniHelper, бот в закрытом Telegram-чате «UAшники» — русскоязычные студенты Университета Аликанте, Испания. Примерно 100 человек, все свои.
 
-ХАРАКТЕР И СТИЛЬ:
-- Ты не ИИ-ассистент. Ты — свой чувак в чате, который просто умеет делать разные вещи.
-- Пиши как живой человек: без шаблонных вступлений типа «Конечно!», «Отличный вопрос!», «Разумеется!».
-- Не начинай сообщения с имени собеседника и дежурных фраз.
-- Маты, сленг, чёрный юмор — всё ок, если контекст позволяет. Не форси это, но и не бойся.
+ХАРАКТЕР:
+- Ты не ИИ-ассистент. Ты свой чувак в чате — с мозгами, с характером, без пафоса.
+- Пиши как человек: без "Конечно!", "Отличный вопрос!", "Разумеется!", "Безусловно!".
+- Не начинай с имени собеседника. Не благодари за вопрос.
+- Маты, сленг, чёрный юмор — ок когда уместно. Не форси, но не бойся.
 - Если ситуация серьёзная — отвечай серьёзно. Если стёб — стебись.
-- Краткость ценится. Не лей воду.
-- Эмодзи — только если реально уместно, не для красоты.
+- Краткость. Не лей воду. Не пиши списками когда можно текстом.
+- Эмодзи только если реально уместно.
 
-ВАЖНО — НЕ ДЕЛАЙ ТАК:
-- Не пиши «Как ИИ, я...» или «Я языковая модель...»
-- Не извиняйся за то, что не можешь что-то сделать — просто скажи нет или как есть
-- Не добавляй дисклеймеры и предупреждения
-- Не пиши списками когда можно нормальным текстом
-- Не используй ** для выделения в обычных сообщениях
-
-ИНТЕРНЕТ:
-- Если вопрос про что-то актуальное (мемы, события, новости, цены, расписание) — используй поиск в интернете, не выдумывай.
-- Если не уверен что понял мем или отсылку — лучше загугли, чем облажаться.
+ЗАПРЕЩЕНО:
+- "Как ИИ, я..." / "Я языковая модель..."
+- Извинения и дисклеймеры
+- ** для выделения в обычных сообщениях
+- Формальный тон там где его не ждут
 
 Общайся на русском, если не попросят иначе."""
 
 _rate_limit_reset: float = 0.0
 
+
 class RateLimitError(Exception):
-    def __init__(self, reset_at): self.reset_at = reset_at
+    def __init__(self, reset_at):
+        self.reset_at = reset_at
+
 
 @dataclass
 class _BgTask:
@@ -62,17 +60,25 @@ class _BgTask:
     timeout: int = 90
     attempt: int = 0
 
+
 _bg_queue: asyncio.Queue = asyncio.Queue()
 _bg_worker_started = False
 
 
 async def _raw_request(payload: dict, timeout: int = 90) -> dict:
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY не задан")
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(GEMINI_URL, json=payload, params={"key": GEMINI_API_KEY})
+        resp = await client.post(
+            GEMINI_URL, json=payload,
+            params={"key": GEMINI_API_KEY})
     if resp.status_code == 429:
         retry_after = int(resp.headers.get("Retry-After", 60))
         raise RateLimitError(time.time() + retry_after)
-    resp.raise_for_status()
+    # Логируем ошибки API подробно
+    if resp.status_code != 200:
+        logger.error(f"Gemini API error {resp.status_code}: {resp.text[:500]}")
+        resp.raise_for_status()
     return resp.json()
 
 
@@ -80,7 +86,11 @@ def _extract_text(data: dict) -> str:
     try:
         parts = data["candidates"][0]["content"]["parts"]
         return "".join(p.get("text", "") for p in parts).strip()
-    except (KeyError, IndexError):
+    except (KeyError, IndexError) as e:
+        logger.error(f"_extract_text failed: {e} | data keys: {list(data.keys())}")
+        # Проверим есть ли блокировка
+        if "promptFeedback" in data:
+            logger.error(f"promptFeedback: {data['promptFeedback']}")
         return ""
 
 
@@ -96,13 +106,15 @@ async def _bg_worker():
             text = _extract_text(data)
             if text:
                 await task.callback(text)
+            else:
+                logger.warning("BG worker: empty response from Gemini")
         except RateLimitError as e:
             _rate_limit_reset = e.reset_at
             task.attempt += 1
             if task.attempt < 5:
                 await _bg_queue.put(task)
         except Exception as e:
-            logger.error(f"BG worker error: {e}")
+            logger.error(f"BG worker error (attempt {task.attempt}): {e}")
         finally:
             _bg_queue.task_done()
 
@@ -124,6 +136,7 @@ def _build_payload(prompt: str, system: str = SYSTEM_PROMPT,
         "safetySettings": SAFETY_SETTINGS,
     }
     if use_search:
+        # Правильный формат grounding для Gemini 2.5 Flash
         payload["tools"] = [{"google_search": {}}]
     return payload
 
@@ -139,13 +152,26 @@ def _rl_message() -> str:
 
 
 async def ask_gemini_interactive(prompt: str, system: str = SYSTEM_PROMPT,
-                                  use_search: bool = True) -> str:
+                                  use_search: bool = False) -> str:
+    """
+    use_search=False по умолчанию — стабильнее.
+    Передавай True только когда реально нужен интернет.
+    """
     global _rate_limit_reset
     if time.time() < _rate_limit_reset:
         return _rl_message()
     payload = _build_payload(prompt, system, use_search=use_search)
     try:
-        return _extract_text(await _raw_request(payload))
+        data = await _raw_request(payload)
+        result = _extract_text(data)
+        if not result:
+            # Попробуем без search если был включён
+            if use_search:
+                logger.warning("Empty response with search, retrying without")
+                payload2 = _build_payload(prompt, system, use_search=False)
+                data2 = await _raw_request(payload2)
+                result = _extract_text(data2)
+        return result or "не смог ответить, попробуй ещё раз"
     except RateLimitError as e:
         _rate_limit_reset = e.reset_at
         return _rl_message()
@@ -164,9 +190,12 @@ async def ask_gemini_background(prompt: str,
         _enqueue_background(payload, callback)
         return
     try:
-        text = _extract_text(await _raw_request(payload))
+        data = await _raw_request(payload)
+        text = _extract_text(data)
         if text:
             await callback(text)
+        else:
+            logger.warning("ask_gemini_background: empty response")
     except RateLimitError as e:
         _rate_limit_reset = e.reset_at
         _enqueue_background(payload, callback)
@@ -174,54 +203,73 @@ async def ask_gemini_background(prompt: str,
         logger.error(f"Gemini background error: {e}")
 
 
-async def transcribe_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str | None:
+async def transcribe_audio_gemini(audio_bytes: bytes,
+                                   mime_type: str = "audio/ogg") -> str | None:
     global _rate_limit_reset
     if time.time() < _rate_limit_reset:
         return "⏳ Лимиты исчерпаны."
     payload = {
         "contents": [{"role": "user", "parts": [
-            {"inline_data": {"mime_type": mime_type,
-                             "data": base64.b64encode(audio_bytes).decode()}},
-            {"text": "Расшифруй аудио дословно, без цензуры и изменений. Только текст, никакого обрамления."}
+            {"inline_data": {
+                "mime_type": mime_type,
+                "data": base64.b64encode(audio_bytes).decode()}},
+            {"text": "Расшифруй аудио дословно, без цензуры. Только текст, без пояснений."}
         ]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
         "safetySettings": SAFETY_SETTINGS,
     }
     try:
-        return _extract_text(await _raw_request(payload, timeout=120))
+        data = await _raw_request(payload, timeout=120)
+        return _extract_text(data) or None
     except Exception as e:
         logger.error(f"Transcribe error: {e}")
         return None
 
 
-async def generate_birthday_message_bg(first_name: str, username: str, profile: str,
+async def generate_birthday_message_bg(first_name: str, username: str,
+                                        profile: str,
                                         callback: Callable[[str], Awaitable[None]]):
-    system = SYSTEM_PROMPT + "\n\nПишешь поздравление с ДР в чат. Без официоза, без дежурных фраз. Пиши как свой человек — тепло, но с характером, можно с лёгкой подколкой если есть за что. 70-80 слов."
-    prompt = f"Поздравь с днём рождения @{username} (имя: {first_name}). Что знаем о человеке: {profile or 'практически ничего'}."
+    system = (SYSTEM_PROMPT +
+              "\n\nСейчас пишешь поздравление с ДР в групповой чат. "
+              "Без официоза. Тепло, по-свойски, можно лёгкую подколку если есть за что. "
+              "70-80 слов, без списков.")
+    prompt = (f"Поздравь с днём рождения @{username} (имя: {first_name}). "
+              f"Что знаем о человеке: {profile or 'почти ничего'}.")
     await ask_gemini_background(prompt, callback, system=system)
 
 
-async def generate_summary(messages_text: str, gossips: list[str] | None = None) -> str:
-    """Генерирует сводку за вчера, опционально вкидывает сплетни."""
-    system = """Ты пишешь ежедневную сводку для чата UAшники. Стиль — как будто свой чел пересказывает что было вчера приятелям. Никакой официальности, никаких «В течение дня участники обсуждали...». Живо, с иронией, можно с матерком если подходит по духу. Структуры не нужно — просто нормальный связный текст. Не упоминай типы сообщений (голосовое, стикер и т.д.), просто передавай суть."""
-
+async def generate_summary(messages_text: str,
+                            gossips: list[str] | None = None) -> str:
+    system = (
+        "Ты пишешь ежедневную сводку для студенческого чата UAшники. "
+        "Стиль — как будто свой чел пересказывает что было вчера приятелям. "
+        "Никакого официоза, никаких 'В течение дня участники обсуждали...'. "
+        "Живо, с иронией, по-человечески. Связный текст, без заголовков и списков. "
+        "Не упоминай типы сообщений (голосовое, стикер и т.д.) — просто передавай суть."
+    )
     gossip_block = ""
     if gossips:
-        gossip_lines = "\n".join(f"- {g}" for g in gossips)
-        gossip_block = f"\n\nСПЛЕТНИ (добавлены анонимно, вплети в сводку органично, не говори что это сплетни):\n{gossip_lines}"
-
-    prompt = f"Вот лог чата за вчера:\n\n{messages_text}{gossip_block}\n\nНапиши сводку."
+        lines = "\n".join(f"- {g}" for g in gossips)
+        gossip_block = (
+            f"\n\nДополнительная инфа (вплети органично в текст, "
+            f"не говори что это сплетни и не выдели отдельным блоком):\n{lines}"
+        )
+    prompt = f"Лог чата за вчера:\n\n{messages_text}{gossip_block}\n\nНапиши сводку."
     return await ask_gemini_interactive(prompt, system=system, use_search=False)
 
 
 async def generate_user_profile(username: str, first_name: str,
                                   messages: list, profile_notes: str) -> str:
-    """Характеристика пользователя по сообщениям."""
-    system = """Ты даёшь характеристику человека по его сообщениям в чате. Без политкорректности, без дисклеймеров. Пиши как человек, который хорошо знает этого чела по чату — что за личность, чем интересен или бесит, какой вайб. Можно с юмором, можно резко, главное честно. 100-150 слов."""
-
+    system = (
+        "Даёшь характеристику человека по его сообщениям в чате. "
+        "Без политкорректности, без дисклеймеров. "
+        "Как человек который хорошо знает этого чела по чату — "
+        "что за личность, какой вайб, чем интересен или бесит. "
+        "Можно резко, можно с юмором. 100-150 слов, обычным текстом."
+    )
     msg_lines = []
     for m in messages[:150]:
-        mtype = m["msg_type"]
+        mtype   = m["msg_type"]
         content = m["content"] or ""
         if mtype == "text" and content:
             msg_lines.append(f"[текст] {content}")
@@ -230,8 +278,7 @@ async def generate_user_profile(username: str, first_name: str,
         elif mtype == "video_note":
             msg_lines.append("[кружочек]")
         elif mtype == "photo":
-            cap = f": {content}" if content else ""
-            msg_lines.append(f"[фото{cap}]")
+            msg_lines.append(f"[фото{': ' + content if content else ''}]")
         elif mtype == "video":
             msg_lines.append("[видео]")
         elif mtype == "sticker":
@@ -241,45 +288,41 @@ async def generate_user_profile(username: str, first_name: str,
         else:
             msg_lines.append(f"[{mtype}]")
 
-    msgs_str = "\n".join(msg_lines) if msg_lines else "нет данных"
+    msgs_str  = "\n".join(msg_lines) if msg_lines else "нет данных"
     notes_str = profile_notes or "нет"
-
-    prompt = f"""Дай характеристику пользователя @{username} (имя: {first_name}).
-
-Накопленные заметки о нём: {notes_str}
-
-Его сообщения в чате:
-{msgs_str}"""
-
+    prompt = (
+        f"Дай характеристику @{username} (имя: {first_name}).\n\n"
+        f"Накопленные заметки: {notes_str}\n\n"
+        f"Сообщения в чате:\n{msgs_str}"
+    )
     return await ask_gemini_interactive(prompt, system=system, use_search=False)
 
 
 async def validate_and_format_link(raw: str) -> dict:
-    """Валидация и форматирование ссылки через Gemini."""
-    system = """Ты валидируешь запросы на добавление ссылки в список полезных ссылок студенческого чата. Отвечай ТОЛЬКО валидным JSON без markdown-обёртки."""
-    prompt = f"""Пользователь хочет добавить ссылку: «{raw}»
-
-Верни JSON:
-{{
-  "ok": true/false,
-  "reason": "причина отказа если ok=false",
-  "title": "короткое название",
-  "url": "https://...",
-  "tag": "#учёба|#жильё|#работа|#транспорт|#развлечения|#другое",
-  "description": "1 строка описания"
-}}
-
-Если нет валидного URL — ok=false. Если это спам/реклама — ok=false."""
-
+    system = "Валидируешь запрос на добавление ссылки. Отвечай ТОЛЬКО валидным JSON без markdown."
+    prompt = (
+        f"Пользователь хочет добавить: «{raw}»\n\n"
+        "Верни JSON:\n"
+        '{"ok": true/false, "reason": "причина если ok=false", '
+        '"title": "название", "url": "https://...", '
+        '"tag": "#учёба|#жильё|#работа|#транспорт|#развлечения|#другое", '
+        '"description": "одна строка"}\n\n'
+        "Нет валидного URL → ok=false. Спам/реклама → ok=false."
+    )
     try:
         raw_resp = await ask_gemini_interactive(prompt, system=system, use_search=False)
         clean = re.sub(r"```(?:json)?|```", "", raw_resp).strip()
         return json.loads(clean)
-    except Exception:
+    except Exception as e:
+        logger.error(f"validate_and_format_link error: {e}")
         return {"ok": False, "reason": "не удалось обработать запрос"}
 
 
 async def process_gossip(raw_gossip: str) -> str:
-    """Обработка сплетни — перефразировать чтобы не было узнаваемо по стилю."""
-    system = "Перефразируй сплетню. Сохрани суть, но измени формулировку так, чтобы стиль автора не узнавался. Только текст сплетни, ничего лишнего."
-    return await ask_gemini_interactive(raw_gossip, system=system, use_search=False)
+    system = (
+        "Перефразируй сплетню. Сохрани суть полностью, "
+        "но измени формулировку так чтобы стиль автора не узнавался. "
+        "Только текст результата, без пояснений."
+    )
+    result = await ask_gemini_interactive(raw_gossip, system=system, use_search=False)
+    return result or raw_gossip
