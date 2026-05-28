@@ -125,6 +125,16 @@ async def update_birthday_profile(user_id, profile):
         await conn.execute(
             "UPDATE birthdays SET user_profile=$2 WHERE user_id=$1", user_id, profile)
 
+async def get_birthday_by_user(user_id):
+    """Получить запись ДР пользователя если есть."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT birth_day, birth_month FROM birthdays WHERE user_id=$1",
+            user_id)
+
+
+
 # ─── Message log ──────────────────────────────────────────────────────────────
 
 async def log_message(chat_id, user_id, username, first_name, msg_type, content):

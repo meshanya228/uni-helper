@@ -5,7 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from aiohttp import web, ClientSession, ClientTimeout
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, BotCommandScopeAllGroupChats
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ChatMemberHandler, CallbackQueryHandler)
@@ -31,13 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
-# ID основного чата UAшников (для авто-сводки и поздравлений в Флудилке).
-# Если не задан — авто-сводка не отправляется, всё остальное работает в любой группе.
-# Можно задать через env MAIN_CHAT_ID, либо вычисляется автоматически
-# при первом сообщении боту в группе.
 MAIN_CHAT_ID = int(os.environ.get("MAIN_CHAT_ID", "0"))
-
-# Реестр всех групп где работает бот (заполняется в runtime)
 _known_group_chats: set[int] = set()
 
 
@@ -55,21 +49,17 @@ async def start_http_server():
     port = int(os.environ.get("PORT", 7860))
     await web.TCPSite(runner, "0.0.0.0", port).start()
     logger.info(f"HTTP server started on :{port}")
-    logger.info(f"HTTP server started on :{port}")
 
 
-# ─── Self-pinger ───────────────────────────────────────────────────────────────
-# Render.com автоматически задаёт переменную RENDER_EXTERNAL_URL — вида
-# https://uni-helper.onrender.com — ничего вручную добавлять не нужно.
+# ─── Self-pinger ──────────────────────────────────────────────────────────────
 
 async def self_ping():
-    """Пингует себя каждые 10 минут. Окно тишины 04:00–06:00 по Мадриду."""
+    """Каждые 10 минут. Окно тишины 04:00–06:00 по Мадриду."""
     now = datetime.now(MADRID_TZ)
     if 4 <= now.hour < 6:
         return
     base = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not base:
-        # Не на Render — пингуем локально
         port = int(os.environ.get("PORT", 7860))
         base = f"http://localhost:{port}"
     url = f"{base}/health"
@@ -79,7 +69,7 @@ async def self_ping():
             async with s.get(url) as r:
                 logger.debug(f"Self-ping {r.status}")
     except Exception as e:
-        logger.debug(f"Self-ping failed (ok if local): {e}")
+        logger.debug(f"Self-ping skipped: {e}")
 
 
 # ─── /start ────────────────────────────────────────────────────────────────────
@@ -87,9 +77,10 @@ async def self_ping():
 async def cmd_start(update: Update, context):
     text = (
         "Привет! Я UniHelper — бот UAшников 🎓\n\n"
-        "/voice — расшифровать голосовое или кружочек\n"
-        "/birthday ДД.ММ — сохранить день рождения\n"
+        "Команды:\n"
         "/ai [вопрос] — спросить у ИИ\n"
+        "/voice — расшифровать голосовое (ответь на него)\n"
+        "/birthday ДД.ММ — сохранить день рождения\n"
         "/summary — сводка за вчера\n"
         "/summarytoggle — вкл/выкл авто-сводку\n"
         "/who @user — характеристика пользователя\n"
@@ -101,30 +92,27 @@ async def cmd_start(update: Update, context):
     await update.message.reply_text(text)
 
 
-# ─── Трекер групп (для авто-сводки) ──────────────────────────────────────────
+# ─── Трекер групп ─────────────────────────────────────────────────────────────
 
 async def track_group(update: Update, context):
-    """Запоминаем все группы где есть бот — для авто-сводки."""
     if update.message and update.message.chat_id:
         from telegram.constants import ChatType
         if update.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
             _known_group_chats.add(update.message.chat_id)
 
 
-# ─── Авто-сводка по всем известным группам ────────────────────────────────────
+# ─── Авто-сводка по всем группам ──────────────────────────────────────────────
 
 async def auto_summary_all(bot):
-    """Планировщик: шлёт сводку в каждую известную группу."""
     targets: set[int] = set()
     if MAIN_CHAT_ID:
         targets.add(MAIN_CHAT_ID)
     targets.update(_known_group_chats)
-
     for chat_id in targets:
         try:
             await send_auto_summary(bot, chat_id)
         except Exception as e:
-            logger.error(f"auto_summary_all error for {chat_id}: {e}")
+            logger.error(f"auto_summary error for {chat_id}: {e}")
 
 
 # ─── Application ──────────────────────────────────────────────────────────────
@@ -133,7 +121,6 @@ async def build_application() -> Application:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app   = Application.builder().token(token).build()
 
-    # Команды
     app.add_handler(CommandHandler("start",         cmd_start))
     app.add_handler(CommandHandler("help",          cmd_start))
     app.add_handler(CommandHandler("voice",         handle_voice_transcribe))
@@ -147,13 +134,9 @@ async def build_application() -> Application:
     app.add_handler(CommandHandler("gossip",        cmd_gossip))
     app.add_handler(CommandHandler("map",           cmd_map))
 
-    # Inline кнопка анонимных сообщений
     app.add_handler(CallbackQueryHandler(handle_anon_callback, pattern=r"^anon:\d+$"))
-
-    # Новые участники
     app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
 
-    # Все сообщения: сначала трекаем группу, потом логируем
     app.add_handler(MessageHandler(
         filters.ALL & ~filters.COMMAND, track_group), group=0)
     app.add_handler(MessageHandler(
@@ -171,34 +154,45 @@ async def main():
 
     app = await build_application()
 
-    await app.bot.set_my_commands([
+    # Команды с подсказками (hint после команды в поле ввода)
+    commands = [
         BotCommand("start",         "Информация о боте"),
         BotCommand("help",          "Справка по командам"),
-        BotCommand("voice",         "Расшифровать голосовое / кружочек"),
-        BotCommand("birthday",      "Сохранить день рождения (ДД.ММ)"),
-        BotCommand("ai",            "Спросить у ИИ"),
+        BotCommand("voice",         "Расшифровать голосовое (ответь на него)"),
+        BotCommand("birthday",      "Сохранить ДР — пример: /birthday 15.03"),
+        BotCommand("ai",            "Спросить у ИИ — пример: /ai расскажи анекдот"),
         BotCommand("summary",       "Сводка за вчера"),
         BotCommand("summarytoggle", "Вкл/выкл авто-сводку"),
-        BotCommand("who",           "Характеристика пользователя"),
-        BotCommand("anon",          "Анонимное сообщение"),
-        BotCommand("gossip",        "Анонимная сплетня"),
+        BotCommand("who",           "Характеристика — пример: /who @username"),
+        BotCommand("anon",          "Анонимно — пример: /anon @user привет"),
+        BotCommand("gossip",        "Сплетня — пример: /gossip слышал что..."),
         BotCommand("links",         "Полезные ссылки"),
         BotCommand("map",           "Карта СССР в Аликанте"),
-    ])
+    ]
+
+    # Устанавливаем команды глобально
+    await app.bot.set_my_commands(commands)
+    # И отдельно для групп (чтобы /command@botname тоже работало)
+    await app.bot.set_my_commands(
+        commands, scope=BotCommandScopeAllGroupChats())
 
     scheduler = AsyncIOScheduler(timezone=MADRID_TZ)
-    scheduler.add_job(check_birthdays,             "cron",     hour=0,  minute=0,  args=[app.bot])
-    scheduler.add_job(auto_summary_all,            "cron",     hour=9,  minute=0,  args=[app.bot])
-    scheduler.add_job(cleanup_expired_anon_messages, "interval", hours=1)
-    scheduler.add_job(cleanup_old_gossips,         "cron",     hour=3,  minute=30)
-    scheduler.add_job(self_ping,                   "interval", minutes=10)
+    scheduler.add_job(check_birthdays,              "cron",     hour=0,  minute=0,  args=[app.bot])
+    scheduler.add_job(auto_summary_all,             "cron",     hour=9,  minute=0,  args=[app.bot])
+    scheduler.add_job(cleanup_expired_anon_messages,"interval", hours=1)
+    scheduler.add_job(cleanup_old_gossips,          "cron",     hour=3,  minute=30)
+    scheduler.add_job(self_ping,                    "interval", minutes=10)
     scheduler.start()
 
     await app.initialize()
     await app.start()
+
+    # drop_pending_updates=True — сбрасываем накопившиеся апдейты
+    # чтобы не было конфликта со старой инстанцией
     await app.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True)
+
     logger.info("UniHelper started ✅")
 
     try:
