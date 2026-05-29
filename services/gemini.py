@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError, ServerError
 
 logger    = logging.getLogger(__name__)
 MADRID_TZ = ZoneInfo("Europe/Madrid")
@@ -58,29 +59,71 @@ SYSTEM_PROMPT = """Ты — UniHelper, бот в закрытом Telegram-ча�
 
 # ─── Rate limit ───────────────────────────────────────────────────────────────
 
+# Минимальный интервал между запросами (секунд) — защита от RPM
+# gemini-3.5-flash preview: ~5-10 RPM на бесплатном тарифе
+_MIN_REQUEST_INTERVAL = 6.0   # 6с между запросами = ~10 RPM max
+_last_request_time: float = 0.0
+_request_lock: asyncio.Lock | None = None
+
 _rate_limit_reset: float = 0.0
+
+
+def _get_lock() -> asyncio.Lock:
+    global _request_lock
+    if _request_lock is None:
+        _request_lock = asyncio.Lock()
+    return _request_lock
+
 
 def _is_rate_limited() -> bool:
     return time.time() < _rate_limit_reset
 
-def _set_rate_limit(seconds: int = 60):
+
+def _set_rate_limit(seconds: int = 70):
     global _rate_limit_reset
     _rate_limit_reset = time.time() + seconds
     t = datetime.fromtimestamp(_rate_limit_reset, tz=MADRID_TZ).strftime('%H:%M')
     logger.warning(f"Rate limit: reset at {t} Madrid")
 
+
 def _rl_message() -> str:
     t = datetime.fromtimestamp(_rate_limit_reset, tz=MADRID_TZ).strftime('%H:%M')
     return f"⏳ Лимиты исчерпаны, попробуй после {t} по Мадриду."
+
 
 def reset_rate_limit():
     global _rate_limit_reset
     _rate_limit_reset = 0.0
 
+
+def _parse_retry_after(e: Exception) -> int:
+    """Парсим retry-after из ошибки 429. Возвращает секунды ожидания."""
+    # Пробуем вытащить из заголовков response
+    try:
+        response = getattr(e, 'response', None)
+        if response is not None:
+            headers = getattr(response, 'headers', {})
+            ra = headers.get('retry-after') or headers.get('Retry-After')
+            if ra:
+                return max(int(ra), 10)
+    except Exception:
+        pass
+
+    # Пробуем вытащить из текста ошибки (retryDelay в JSON)
+    err_str = str(e)
+    m = re.search(r'retryDelay["\s:]+(\d+)', err_str)
+    if m:
+        return max(int(m.group(1)), 10)
+
+    # По умолчанию — 70 секунд (чуть больше минуты)
+    return 70
+
+
 # ─── Клиент ───────────────────────────────────────────────────────────────────
 
 def _get_client() -> genai.Client:
     return genai.Client(api_key=GEMINI_API_KEY)
+
 
 # ─── Базовый запрос ───────────────────────────────────────────────────────────
 
@@ -90,8 +133,11 @@ async def _call_gemini(prompt: str,
                        tokens: int = 1024) -> str | None:
     """
     Вызов Gemini API. Возвращает текст или None.
-    Rate limit устанавливается ТОЛЬКО при финальном 429 после всех попыток.
+    Использует глобальный lock чтобы не отправлять запросы чаще чем раз в
+    _MIN_REQUEST_INTERVAL секунд — иначе на preview-модели сразу 429.
     """
+    global _last_request_time
+
     client = _get_client()
     config = types.GenerateContentConfig(
         system_instruction=system,
@@ -100,10 +146,17 @@ async def _call_gemini(prompt: str,
         safety_settings=_SAFETY,
     )
 
-    last_error = None
+    lock = _get_lock()
+
     for attempt in range(3):
-        if attempt > 0:
-            await asyncio.sleep(2 ** attempt)  # 2s, 4s
+        # ── Соблюдаем минимальный интервал между запросами ──
+        async with lock:
+            now = time.time()
+            wait = _last_request_time + _MIN_REQUEST_INTERVAL - now
+            if wait > 0:
+                logger.debug(f"Throttle: sleeping {wait:.1f}s before attempt {attempt+1}")
+                await asyncio.sleep(wait)
+            _last_request_time = time.time()
 
         try:
             response = await client.aio.models.generate_content(
@@ -111,54 +164,89 @@ async def _call_gemini(prompt: str,
                 contents=prompt,
                 config=config,
             )
-        except Exception as e:
-            err = str(e)
-            logger.error(f"Gemini API error (attempt {attempt+1}/3): {err[:200]}")
-            last_error = err
+        except ClientError as e:
+            err_str = str(e)
+            logger.error(f"Gemini ClientError (attempt {attempt+1}/3): {err_str[:300]}")
 
             # 429 — rate limit
-            if "429" in err or "resource_exhausted" in err.lower() or "quota" in err.lower():
-                if attempt == 2:  # финальная попытка
-                    _set_rate_limit(60)
+            if e.code == 429 or "429" in err_str or "resource_exhausted" in err_str.lower() or "quota" in err_str.lower():
+                retry_after = _parse_retry_after(e)
+                logger.warning(f"Rate limit 429, retry_after={retry_after}s")
+                if attempt == 2:
+                    _set_rate_limit(retry_after)
+                    return None
+                # Ждём перед следующей попыткой
+                wait_s = retry_after if attempt == 1 else min(retry_after, 15)
+                logger.warning(f"Waiting {wait_s}s before retry...")
+                await asyncio.sleep(wait_s)
                 continue
 
-            # 404 — модель не найдена или неверный endpoint — нет смысла повторять
-            if "404" in err or "not found" in err.lower():
-                logger.error(f"Model not found: {GEMINI_MODEL}. Check model name.")
+            # 404 — модель не найдена
+            if e.code == 404 or "not found" in err_str.lower():
+                logger.error(f"Model not found: {GEMINI_MODEL}")
                 return None
 
-            # Другие ошибки — повторяем
+            # Другие клиентские ошибки — не повторяем
+            logger.error(f"Unrecoverable client error: {e.code}")
+            return None
+
+        except ServerError as e:
+            logger.error(f"Gemini ServerError (attempt {attempt+1}/3): {e}")
+            if attempt < 2:
+                await asyncio.sleep(5 * (attempt + 1))
             continue
 
-        # Получили response — извлекаем текст
+        except Exception as e:
+            err_str = str(e)
+            logger.error(f"Gemini unexpected error (attempt {attempt+1}/3): {err_str[:300]}")
+
+            # Перехватываем 429 из нетипизированных исключений
+            if "429" in err_str or "resource_exhausted" in err_str.lower() or "quota" in err_str.lower():
+                retry_after = _parse_retry_after(e)
+                if attempt == 2:
+                    _set_rate_limit(retry_after)
+                    return None
+                await asyncio.sleep(retry_after if attempt == 1 else min(retry_after, 15))
+                continue
+
+            if "404" in err_str or "not found" in err_str.lower():
+                logger.error(f"Model not found: {GEMINI_MODEL}")
+                return None
+
+            if attempt < 2:
+                await asyncio.sleep(3 * (attempt + 1))
+            continue
+
+        # ── Успешный ответ ──
         try:
             text = response.text
             if text and text.strip():
                 return text.strip()
-            # Пустой текст — смотрим причину
+
             logger.warning(f"Empty response (attempt {attempt+1}/3)")
             try:
                 for c in response.candidates:
                     logger.warning(f"  finish_reason={c.finish_reason}")
-                    # Если SAFETY — не повторяем, это осознанная блокировка
                     if str(c.finish_reason) in ("SAFETY", "2"):
                         logger.warning("  Blocked by safety — returning None")
                         return None
             except Exception:
                 pass
+            # Пустой, но не SAFETY — попробуем ещё раз
+            await asyncio.sleep(3)
             continue
 
         except ValueError as ve:
-            # response.text бросает ValueError при пустых candidates
             logger.warning(f"response.text ValueError (attempt {attempt+1}/3): {ve}")
             try:
                 for c in response.candidates:
                     logger.warning(f"  finish_reason={c.finish_reason}")
             except Exception:
                 pass
+            await asyncio.sleep(3)
             continue
 
-    logger.error(f"All 3 attempts failed. Last error: {last_error}")
+    logger.error("All 3 attempts failed.")
     return None
 
 
@@ -193,27 +281,28 @@ class _BgTask:
     tokens:   int   = 1024
     attempt:  int   = 0
 
-_bg_queue:          asyncio.Queue = asyncio.Queue()
-_bg_worker_started: bool          = False
+_bg_queue: asyncio.Queue = asyncio.Queue()
+_bg_worker_task: asyncio.Task | None = None
 
 
 async def _bg_worker():
     while True:
         task: _BgTask = await _bg_queue.get()
         try:
-            # Ждём если rate limit
             if _is_rate_limited():
                 wait = _rate_limit_reset - time.time()
                 if wait > 0:
-                    await asyncio.sleep(wait + 1)
+                    await asyncio.sleep(wait + 2)
 
             result = await _call_gemini(task.prompt, task.system, task.temp, task.tokens)
             if result:
                 await task.callback(result)
-            elif task.attempt < 3:
+            elif task.attempt < 2:
                 task.attempt += 1
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)
                 await _bg_queue.put(task)
+            else:
+                logger.error("BG task failed after 3 attempts, dropping.")
         except Exception as e:
             logger.error(f"BG worker error: {e}")
         finally:
@@ -221,10 +310,10 @@ async def _bg_worker():
 
 
 def ensure_bg_worker():
-    global _bg_worker_started
-    if not _bg_worker_started:
-        asyncio.get_event_loop().create_task(_bg_worker())
-        _bg_worker_started = True
+    global _bg_worker_task
+    if _bg_worker_task is None or _bg_worker_task.done():
+        loop = asyncio.get_event_loop()
+        _bg_worker_task = loop.create_task(_bg_worker())
 
 # ─── Публичные функции ────────────────────────────────────────────────────────
 
@@ -237,7 +326,7 @@ async def ask_gemini_interactive(prompt: str,
     if result is None:
         if _is_rate_limited():
             return _rl_message()
-        return "не смог ответить, попробуй ещё раз"
+        return "что-то пошло не так, попробуй ещё раз"
     return result
 
 
@@ -340,12 +429,11 @@ async def process_gossip(raw_gossip: str) -> str:
 async def check_api_health() -> str:
     if not GEMINI_API_KEY:
         return "❌ GEMINI_API_KEY не задан"
-    # Короткий тестовый запрос без установки rate limit
-    reset_rate_limit()  # сброс на старте
-    result = await _call_gemini("hi", system="Reply: ok", tokens=5, temp=0.1)
+    reset_rate_limit()
+    result = await _call_gemini("hi", system="Reply with exactly: ok", tokens=5, temp=0.1)
     if result:
         return f"✅ Gemini OK (модель: {GEMINI_MODEL})"
     if _is_rate_limited():
         t = datetime.fromtimestamp(_rate_limit_reset, tz=MADRID_TZ).strftime('%H:%M')
         return f"⚠️ Rate limit до {t}"
-    return f"❌ Gemini не отвечает — проверь ключ или название модели ({GEMINI_MODEL})"
+    return f"❌ Gemini не отвечает — проверь ключ или модель ({GEMINI_MODEL})"
