@@ -25,7 +25,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old_status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED,
                        ChatMemberStatus.RESTRICTED)
         and new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED,
-                           ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
+                           ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
     )
     if not joined:
         return
