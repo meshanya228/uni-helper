@@ -21,7 +21,7 @@ from google.genai import types
 logger    = logging.getLogger(__name__)
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
-GEMINI_MODEL   = "gemini-2.5-flash"
+GEMINI_MODEL   = "gemini-3.5-flash"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Safety — всё отключено
