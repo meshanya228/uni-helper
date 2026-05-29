@@ -49,12 +49,17 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Напиши вопрос после /ai")
         return
     prompt = " ".join(context.args)
-    # Включаем поиск только если вопрос про что-то актуальное/текущее
-    search_keywords = ("сейчас", "сегодня", "вчера", "2024", "2025", "новост",
-                       "курс", "погод", "расписани", "когда", "кто такой",
-                       "что случил", "последн", "актуальн", "недавно")
-    use_search = any(kw in prompt.lower() for kw in search_keywords)
-    res = await ask_gemini_interactive(prompt, use_search=use_search)
+
+    # Показываем индикатор что думаем
+    thinking_msg = await msg.reply_text("⏳ думаю...")
+
+    res = await ask_gemini_interactive(prompt)
+
+    # Удаляем индикатор и отправляем ответ
+    try:
+        await thinking_msg.delete()
+    except Exception:
+        pass
     await msg.reply_text(res)
 
 

@@ -38,6 +38,9 @@ _SAFETY = [
     types.SafetySetting(
         category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
         threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    types.SafetySetting(
+        category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
+        threshold=types.HarmBlockThreshold.BLOCK_NONE),
 ]
 
 SYSTEM_PROMPT = """Ты — UniHelper, бот в закрытом Telegram-чате «UAшники» — русскоязычные студенты Университета Аликанте, Испания. Примерно 100 человек, все свои.
@@ -114,11 +117,35 @@ async def _call_gemini(
                 contents=prompt,
                 config=config,
             )
-            # Достаём текст
-            text = response.text
+            # Достаём текст — response.text может бросить ValueError при блокировке
+            try:
+                text = response.text
+            except ValueError as ve:
+                # Обычно это SAFETY block или пустые candidates
+                logger.warning(f"response.text error (attempt {attempt+1}): {ve}")
+                # Логируем finish_reason для диагностики
+                try:
+                    for cand in response.candidates:
+                        logger.warning(f"  candidate finish_reason: {cand.finish_reason}")
+                except Exception:
+                    pass
+                # При блокировке safety — пробуем без system_instruction (смягчаем)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                return None
             if text:
                 return text.strip()
+            # Пустой текст — логируем полный response для диагностики
             logger.warning(f"Empty response from Gemini (attempt {attempt+1})")
+            try:
+                for cand in response.candidates:
+                    logger.warning(f"  finish_reason={cand.finish_reason}, safety={getattr(cand,'safety_ratings',None)}")
+            except Exception:
+                pass
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+                continue
             return None
 
         except Exception as e:
