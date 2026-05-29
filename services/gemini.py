@@ -1,7 +1,7 @@
 """
-Gemini API integration через официальный SDK google-genai.
-Клиент: genai.Client  |  Модель: gemini-2.5-flash
-Поддерживает: интерактивные запросы, фоновая очередь, транскрипция аудио.
+Gemini API — официальный SDK google-genai.
+Клиент: genai.Client(api_key=...)
+Модель: gemini-3.5-flash
 """
 import asyncio
 import base64
@@ -10,7 +10,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Awaitable
 from zoneinfo import ZoneInfo
@@ -26,21 +26,16 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Safety — всё отключено
 _SAFETY = [
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE),
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE),
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE),
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE),
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
+                        threshold=types.HarmBlockThreshold.BLOCK_NONE),
 ]
 
 SYSTEM_PROMPT = """Ты — UniHelper, бот в закрытом Telegram-чате «UAшники» — русскоязычные студенты Университета Аликанте, Испания. Примерно 100 человек, все свои.
@@ -61,43 +56,41 @@ SYSTEM_PROMPT = """Ты — UniHelper, бот в закрытом Telegram-ча�
 
 Общайся на русском, если не попросят иначе."""
 
-# ─── Клиент ───────────────────────────────────────────────────────────────────
-
-def _get_client() -> genai.Client:
-    return genai.Client(api_key=GEMINI_API_KEY)
-
 # ─── Rate limit ───────────────────────────────────────────────────────────────
 
 _rate_limit_reset: float = 0.0
 
-def _rl_message() -> str:
-    dt = datetime.fromtimestamp(_rate_limit_reset, tz=MADRID_TZ).strftime('%H:%M')
-    return f"⏳ Лимиты исчерпаны, попробуй после {dt} по Мадриду."
-
 def _is_rate_limited() -> bool:
     return time.time() < _rate_limit_reset
 
-def _set_rate_limit(retry_after_seconds: int = 60):
+def _set_rate_limit(seconds: int = 60):
     global _rate_limit_reset
-    _rate_limit_reset = time.time() + retry_after_seconds
-    logger.warning(f"Rate limit set, reset at {datetime.fromtimestamp(_rate_limit_reset, tz=MADRID_TZ).strftime('%H:%M')}")
+    _rate_limit_reset = time.time() + seconds
+    t = datetime.fromtimestamp(_rate_limit_reset, tz=MADRID_TZ).strftime('%H:%M')
+    logger.warning(f"Rate limit: reset at {t} Madrid")
+
+def _rl_message() -> str:
+    t = datetime.fromtimestamp(_rate_limit_reset, tz=MADRID_TZ).strftime('%H:%M')
+    return f"⏳ Лимиты исчерпаны, попробуй после {t} по Мадриду."
 
 def reset_rate_limit():
     global _rate_limit_reset
     _rate_limit_reset = 0.0
 
+# ─── Клиент ───────────────────────────────────────────────────────────────────
+
+def _get_client() -> genai.Client:
+    return genai.Client(api_key=GEMINI_API_KEY)
+
 # ─── Базовый запрос ───────────────────────────────────────────────────────────
 
-async def _call_gemini(
-    prompt: str,
-    system: str = SYSTEM_PROMPT,
-    temp: float = 0.9,
-    tokens: int = 1024,
-) -> str | None:
+async def _call_gemini(prompt: str,
+                       system: str = SYSTEM_PROMPT,
+                       temp: float = 0.9,
+                       tokens: int = 1024) -> str | None:
     """
-    Основной async вызов Gemini через новый SDK.
-    Возвращает текст ответа или None при ошибке.
-    Обрабатывает rate limit (429) с экспоненциальной задержкой.
+    Вызов Gemini API. Возвращает текст или None.
+    Rate limit устанавливается ТОЛЬКО при финальном 429 после всех попыток.
     """
     client = _get_client()
     config = types.GenerateContentConfig(
@@ -107,72 +100,69 @@ async def _call_gemini(
         safety_settings=_SAFETY,
     )
 
-    max_retries = 3
-    delay       = 4  # секунды, экспоненциально растёт
+    last_error = None
+    for attempt in range(3):
+        if attempt > 0:
+            await asyncio.sleep(2 ** attempt)  # 2s, 4s
 
-    for attempt in range(max_retries):
         try:
             response = await client.aio.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
                 config=config,
             )
-            # Достаём текст — response.text может бросить ValueError при блокировке
-            try:
-                text = response.text
-            except ValueError as ve:
-                # Обычно это SAFETY block или пустые candidates
-                logger.warning(f"response.text error (attempt {attempt+1}): {ve}")
-                # Логируем finish_reason для диагностики
-                try:
-                    for cand in response.candidates:
-                        logger.warning(f"  candidate finish_reason: {cand.finish_reason}")
-                except Exception:
-                    pass
-                # При блокировке safety — пробуем без system_instruction (смягчаем)
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1)
-                    continue
+        except Exception as e:
+            err = str(e)
+            logger.error(f"Gemini API error (attempt {attempt+1}/3): {err[:200]}")
+            last_error = err
+
+            # 429 — rate limit
+            if "429" in err or "resource_exhausted" in err.lower() or "quota" in err.lower():
+                if attempt == 2:  # финальная попытка
+                    _set_rate_limit(60)
+                continue
+
+            # 404 — модель не найдена или неверный endpoint — нет смысла повторять
+            if "404" in err or "not found" in err.lower():
+                logger.error(f"Model not found: {GEMINI_MODEL}. Check model name.")
                 return None
-            if text:
+
+            # Другие ошибки — повторяем
+            continue
+
+        # Получили response — извлекаем текст
+        try:
+            text = response.text
+            if text and text.strip():
                 return text.strip()
-            # Пустой текст — логируем полный response для диагностики
-            logger.warning(f"Empty response from Gemini (attempt {attempt+1})")
+            # Пустой текст — смотрим причину
+            logger.warning(f"Empty response (attempt {attempt+1}/3)")
             try:
-                for cand in response.candidates:
-                    logger.warning(f"  finish_reason={cand.finish_reason}, safety={getattr(cand,'safety_ratings',None)}")
+                for c in response.candidates:
+                    logger.warning(f"  finish_reason={c.finish_reason}")
+                    # Если SAFETY — не повторяем, это осознанная блокировка
+                    if str(c.finish_reason) in ("SAFETY", "2"):
+                        logger.warning("  Blocked by safety — returning None")
+                        return None
             except Exception:
                 pass
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2)
-                continue
-            return None
+            continue
 
-        except Exception as e:
-            err_str = str(e).lower()
+        except ValueError as ve:
+            # response.text бросает ValueError при пустых candidates
+            logger.warning(f"response.text ValueError (attempt {attempt+1}/3): {ve}")
+            try:
+                for c in response.candidates:
+                    logger.warning(f"  finish_reason={c.finish_reason}")
+            except Exception:
+                pass
+            continue
 
-            # Rate limit
-            if "429" in str(e) or "resource_exhausted" in err_str or "quota" in err_str:
-                _set_rate_limit(retry_after_seconds=delay * (2 ** attempt))
-                if attempt < max_retries - 1:
-                    logger.info(f"Rate limit hit, waiting {delay}s before retry")
-                    await asyncio.sleep(delay)
-                    delay *= 2
-                    continue
-                return None
-
-            # Другие ошибки — логируем и выходим
-            logger.error(f"Gemini error (attempt {attempt+1}): {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2)
-                continue
-            return None
-
+    logger.error(f"All 3 attempts failed. Last error: {last_error}")
     return None
 
 
 async def _call_gemini_audio(audio_bytes: bytes, mime_type: str) -> str | None:
-    """Транскрипция аудио через Gemini."""
     client = _get_client()
     config = types.GenerateContentConfig(
         temperature=0.1,
@@ -181,7 +171,6 @@ async def _call_gemini_audio(audio_bytes: bytes, mime_type: str) -> str | None:
     )
     audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
     text_part  = "Расшифруй аудио дословно, без цензуры. Только текст, без пояснений."
-
     try:
         response = await client.aio.models.generate_content(
             model=GEMINI_MODEL,
@@ -209,20 +198,21 @@ _bg_worker_started: bool          = False
 
 
 async def _bg_worker():
-    global _rate_limit_reset
     while True:
         task: _BgTask = await _bg_queue.get()
         try:
-            # Ждём если rate limit активен
-            wait = _rate_limit_reset - time.time()
-            if wait > 0:
-                await asyncio.sleep(wait + 1)
+            # Ждём если rate limit
+            if _is_rate_limited():
+                wait = _rate_limit_reset - time.time()
+                if wait > 0:
+                    await asyncio.sleep(wait + 1)
 
             result = await _call_gemini(task.prompt, task.system, task.temp, task.tokens)
             if result:
                 await task.callback(result)
-            elif task.attempt < 4:
+            elif task.attempt < 3:
                 task.attempt += 1
+                await asyncio.sleep(5)
                 await _bg_queue.put(task)
         except Exception as e:
             logger.error(f"BG worker error: {e}")
@@ -238,133 +228,98 @@ def ensure_bg_worker():
 
 # ─── Публичные функции ────────────────────────────────────────────────────────
 
-async def ask_gemini_interactive(
-    prompt: str,
-    system: str = SYSTEM_PROMPT,
-    use_search: bool = False,   # параметр оставлен для совместимости, не используется
-) -> str:
-    """Интерактивный запрос — ждём ответа здесь."""
+async def ask_gemini_interactive(prompt: str,
+                                  system: str = SYSTEM_PROMPT,
+                                  use_search: bool = False) -> str:
     if _is_rate_limited():
         return _rl_message()
-
     result = await _call_gemini(prompt, system)
     if result is None:
         if _is_rate_limited():
             return _rl_message()
-        return "что-то пошло не так, попробуй ещё раз"
+        return "не смог ответить, попробуй ещё раз"
     return result
 
 
-async def ask_gemini_background(
-    prompt: str,
-    callback: Callable[[str], Awaitable[None]],
-    system: str = SYSTEM_PROMPT,
-    use_search: bool = False,
-):
-    """Фоновый запрос — результат приходит в callback."""
+async def ask_gemini_background(prompt: str,
+                                 callback: Callable[[str], Awaitable[None]],
+                                 system: str = SYSTEM_PROMPT,
+                                 use_search: bool = False):
     if _is_rate_limited():
-        # Ставим в очередь — воркер дождётся снятия лимита
         _bg_queue.put_nowait(_BgTask(prompt=prompt, system=system, callback=callback))
         return
-
     result = await _call_gemini(prompt, system)
     if result:
         await callback(result)
-    else:
-        if _is_rate_limited():
-            _bg_queue.put_nowait(_BgTask(prompt=prompt, system=system, callback=callback))
+    elif _is_rate_limited():
+        _bg_queue.put_nowait(_BgTask(prompt=prompt, system=system, callback=callback))
 
 
-async def transcribe_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str | None:
-    """Расшифровка голосового сообщения или кружочка."""
+async def transcribe_audio_gemini(audio_bytes: bytes,
+                                   mime_type: str = "audio/ogg") -> str | None:
     if _is_rate_limited():
         return "⏳ Лимиты исчерпаны."
     return await _call_gemini_audio(audio_bytes, mime_type)
 
 
-async def generate_birthday_message_bg(
-    first_name: str,
-    username:   str,
-    profile:    str,
-    callback:   Callable[[str], Awaitable[None]],
-):
-    system = (
-        SYSTEM_PROMPT
-        + "\n\nСейчас пишешь поздравление с ДР в групповой чат. "
-        "Без официоза. Тепло, по-свойски, можно лёгкую подколку если есть за что. "
-        "70-80 слов, обычным текстом без списков."
-    )
-    prompt = (
-        f"Поздравь с днём рождения @{username} (имя: {first_name}). "
-        f"Что знаем о человеке: {profile or 'почти ничего'}."
-    )
+async def generate_birthday_message_bg(first_name: str, username: str,
+                                        profile: str,
+                                        callback: Callable[[str], Awaitable[None]]):
+    system = (SYSTEM_PROMPT
+              + "\n\nПишешь поздравление с ДР в групповой чат. "
+                "Без официоза. Тепло, по-свойски, можно лёгкую подколку. "
+                "70-80 слов, обычным текстом.")
+    prompt = (f"Поздравь с днём рождения @{username} (имя: {first_name}). "
+              f"Что знаем: {profile or 'почти ничего'}.")
     await ask_gemini_background(prompt, callback, system=system)
 
 
-async def generate_summary(messages_text: str, gossips: list[str] | None = None) -> str:
-    system = (
-        "Ты пишешь ежедневную сводку для студенческого чата UAшники. "
-        "Стиль — как будто свой чел пересказывает что было вчера приятелям. "
-        "Никакого официоза. Живо, с иронией, по-человечески. "
-        "Связный текст, без заголовков и списков. "
-        "Не упоминай типы сообщений (голосовое, стикер и т.д.) — просто суть."
-    )
+async def generate_summary(messages_text: str,
+                            gossips: list[str] | None = None) -> str:
+    system = ("Пишешь ежедневную сводку для студенческого чата UAшники. "
+              "Стиль — свой чел пересказывает что было вчера приятелям. "
+              "Никакого официоза. Живо, с иронией. "
+              "Связный текст, без заголовков и списков. "
+              "Не упоминай типы сообщений (голосовое, стикер) — просто суть.")
     gossip_block = ""
     if gossips:
         lines = "\n".join(f"- {g}" for g in gossips)
-        gossip_block = (
-            f"\n\nДополнительная инфа для сводки (вплети органично, "
-            f"не говори что это сплетни):\n{lines}"
-        )
+        gossip_block = (f"\n\nДоп инфа (вплети органично, "
+                        f"не говори что это сплетни):\n{lines}")
     prompt = f"Лог чата за вчера:\n\n{messages_text}{gossip_block}\n\nНапиши сводку."
-    result = await ask_gemini_interactive(prompt, system=system)
-    return result
+    return await ask_gemini_interactive(prompt, system=system)
 
 
-async def generate_user_profile(
-    username:      str,
-    first_name:    str,
-    messages:      list,
-    profile_notes: str,
-) -> str:
-    system = (
-        "Даёшь характеристику человека по его сообщениям в чате. "
-        "Без политкорректности, без дисклеймеров. "
-        "Как человек который хорошо знает этого чела по чату — "
-        "что за личность, какой вайб, чем интересен или бесит. "
-        "Можно резко, можно с юмором. 100-150 слов, обычным текстом."
-    )
-    msg_lines = []
+async def generate_user_profile(username: str, first_name: str,
+                                  messages: list, profile_notes: str) -> str:
+    system = ("Даёшь характеристику человека по его сообщениям. "
+              "Без политкорректности, без дисклеймеров. "
+              "Как человек который хорошо знает этого чела по чату. "
+              "Можно резко, можно с юмором. 100-150 слов, обычным текстом.")
+    lines = []
     for m in messages[:150]:
-        mtype   = m["msg_type"]
-        content = m["content"] or ""
-        if   mtype == "text"       and content: msg_lines.append(f"[текст] {content}")
-        elif mtype == "voice":                  msg_lines.append("[голосовое]")
-        elif mtype == "video_note":             msg_lines.append("[кружочек]")
-        elif mtype == "photo":                  msg_lines.append(f"[фото{': '+content if content else ''}]")
-        elif mtype == "video":                  msg_lines.append("[видео]")
-        elif mtype == "sticker":                msg_lines.append(f"[стикер {content}]" if content else "[стикер]")
-        elif mtype == "animation":              msg_lines.append("[гифка]")
-        else:                                   msg_lines.append(f"[{mtype}]")
-
-    prompt = (
-        f"Дай характеристику @{username} (имя: {first_name}).\n\n"
-        f"Накопленные заметки: {profile_notes or 'нет'}\n\n"
-        f"Сообщения:\n{chr(10).join(msg_lines) if msg_lines else 'нет данных'}"
-    )
+        t, c = m["msg_type"], m["content"] or ""
+        if   t == "text"       and c: lines.append(f"[текст] {c}")
+        elif t == "voice":             lines.append("[голосовое]")
+        elif t == "video_note":        lines.append("[кружочек]")
+        elif t == "photo":             lines.append(f"[фото{': '+c if c else ''}]")
+        elif t == "video":             lines.append("[видео]")
+        elif t == "sticker":           lines.append(f"[стикер {c}]" if c else "[стикер]")
+        elif t == "animation":         lines.append("[гифка]")
+        else:                          lines.append(f"[{t}]")
+    prompt = (f"Характеристика @{username} (имя: {first_name}).\n\n"
+              f"Заметки: {profile_notes or 'нет'}\n\n"
+              f"Сообщения:\n{chr(10).join(lines) if lines else 'нет данных'}")
     return await ask_gemini_interactive(prompt, system=system)
 
 
 async def validate_and_format_link(raw: str) -> dict:
     system = "Валидируешь запрос на добавление ссылки. Отвечай ТОЛЬКО валидным JSON без markdown."
-    prompt = (
-        f"Пользователь хочет добавить: «{raw}»\n\n"
-        'Верни JSON: {"ok": true/false, "reason": "если ok=false", '
-        '"title": "название", "url": "https://...", '
-        '"tag": "#учёба|#жильё|#работа|#транспорт|#развлечения|#другое", '
-        '"description": "одна строка"}\n\n'
-        "Нет валидного URL → ok=false. Спам/реклама → ok=false."
-    )
+    prompt = (f"Пользователь хочет добавить: «{raw}»\n\n"
+              'Верни JSON: {"ok": true/false, "reason": "если ok=false", '
+              '"title": "название", "url": "https://...", '
+              '"tag": "#учёба|#жильё|#работа|#транспорт|#развлечения|#другое", '
+              '"description": "одна строка"}\n\nНет URL → ok=false.')
     try:
         raw_resp = await ask_gemini_interactive(prompt, system=system)
         clean    = re.sub(r"```(?:json)?|```", "", raw_resp).strip()
@@ -375,22 +330,22 @@ async def validate_and_format_link(raw: str) -> dict:
 
 
 async def process_gossip(raw_gossip: str) -> str:
-    system = (
-        "Перефразируй сплетню. Сохрани суть полностью, "
-        "но измени формулировку так чтобы стиль автора не узнавался. "
-        "Только текст результата, без пояснений."
-    )
+    system = ("Перефразируй сплетню. Сохрани суть, "
+              "измени формулировку чтобы стиль автора не узнавался. "
+              "Только текст результата.")
     result = await ask_gemini_interactive(raw_gossip, system=system)
     return result or raw_gossip
 
 
 async def check_api_health() -> str:
-    """Проверка API при старте бота."""
     if not GEMINI_API_KEY:
-        return "❌ GEMINI_API_KEY не задан в переменных окружения"
-    result = await _call_gemini("Привет", system="Ответь одним словом.", tokens=5)
+        return "❌ GEMINI_API_KEY не задан"
+    # Короткий тестовый запрос без установки rate limit
+    reset_rate_limit()  # сброс на старте
+    result = await _call_gemini("hi", system="Reply: ok", tokens=5, temp=0.1)
     if result:
-        return f"✅ Gemini API работает (модель: {GEMINI_MODEL})"
+        return f"✅ Gemini OK (модель: {GEMINI_MODEL})"
     if _is_rate_limited():
-        return f"⚠️ Rate limit активен до {datetime.fromtimestamp(_rate_limit_reset, tz=MADRID_TZ).strftime('%H:%M')}"
-    return f"❌ Gemini API не отвечает — проверь ключ GEMINI_API_KEY"
+        t = datetime.fromtimestamp(_rate_limit_reset, tz=MADRID_TZ).strftime('%H:%M')
+        return f"⚠️ Rate limit до {t}"
+    return f"❌ Gemini не отвечает — проверь ключ или название модели ({GEMINI_MODEL})"
