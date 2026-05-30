@@ -8,7 +8,9 @@ from utils.db import (
     get_yesterday_messages, check_summary_used, mark_summary_used,
     cleanup_old_messages, get_user_by_username, get_user_messages,
     get_user_profile, get_yesterdays_gossips, get_auto_summary, toggle_auto_summary)
-from services.gemini import ask_gemini_interactive, generate_summary, generate_user_profile
+from services.gemini import (
+    ask_gemini_interactive, generate_summary, generate_user_profile,
+    dynamic_tokens, SYSTEM_PROMPT)
 
 logger = logging.getLogger(__name__)
 MAIN_TOPIC_ID = 1  # Флудилка
@@ -50,12 +52,13 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     prompt = " ".join(context.args)
 
-    # Показываем индикатор что думаем
+    # Динамический лимит токенов в зависимости от длины вопроса
+    max_tokens = dynamic_tokens(prompt)
+
     thinking_msg = await msg.reply_text("⏳ думаю...")
 
-    res = await ask_gemini_interactive(prompt)
+    res = await ask_gemini_interactive(prompt, tokens=max_tokens)
 
-    # Удаляем индикатор и отправляем ответ
     try:
         await thinking_msg.delete()
     except Exception:
