@@ -25,7 +25,7 @@ from google.genai.errors import ClientError, ServerError
 logger    = logging.getLogger(__name__)
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
-GEMINI_MODEL   = "gemini-2.5-flash"
+GEMINI_MODEL   = "gemini-3.5-flash"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 IMAGEN_MODEL   = "imagen-3.0-generate-002"
 
@@ -467,3 +467,4 @@ async def check_api_health() -> str:
         return f"❌ ClientError {e.code}"
     except Exception as e:
         return f"❌ {str(e)[:80]}"
+
