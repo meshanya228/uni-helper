@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Callable, Awaitable
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError, ServerError
@@ -309,8 +310,23 @@ async def _call_gemini(prompt,
             await asyncio.sleep(2)
             continue
 
+        except aiohttp.ClientConnectorDNSError:
+            # DNS ошибка — временная проблема сети, пробуем следующую модель
+            logger.warning(f"{model_state.name}: DNS error, trying next model")
+            await asyncio.sleep(2)
+            continue
+
+        except aiohttp.ClientError:
+            # Любая другая сетевая ошибка aiohttp
+            logger.warning(f"{model_state.name}: aiohttp network error, trying next model")
+            await asyncio.sleep(2)
+            continue
+
         except Exception as e:
-            err = str(e)
+            try:
+                err = str(e)
+            except Exception:
+                err = repr(e)
             logger.error(f"{model_state.name} unexpected error: {err[:250]}")
             if "429" in err or "resource_exhausted" in err.lower() or "quota" in err.lower():
                 _block_model(model_state, _parse_retry_after(e))
