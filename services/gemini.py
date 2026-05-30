@@ -1,6 +1,10 @@
 """
-Gemini API — google-genai SDK.
-Модель: gemini-3.5-flash (thinking=MINIMAL)
+Gemini service — google-genai SDK.
+Модель: gemini-2.5-flash (thinking=MINIMAL)
+Дополнительно:
+  - generate_image()   — Imagen 3 (text-to-image)
+  - ask_gemini_with_search() — grounding через Google Search
+  - ask_gemini_with_code()   — code execution в Google sandbox
 """
 import asyncio
 import json
@@ -21,8 +25,9 @@ from google.genai.errors import ClientError, ServerError
 logger    = logging.getLogger(__name__)
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
-GEMINI_MODEL   = "gemini-3.5-flash"
+GEMINI_MODEL   = "gemini-2.5-flash"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+IMAGEN_MODEL   = "imagen-3.0-generate-002"
 
 DEFAULT_MAX_TOKENS = 8192
 
@@ -65,7 +70,7 @@ def _set_rate_limit(seconds: int = 65):
     global _rate_limit_reset
     _rate_limit_reset = time.time() + seconds
     t = datetime.fromtimestamp(_rate_limit_reset, tz=MADRID_TZ).strftime('%H:%M')
-    logger.warning(f"Rate limit: retry after {t} Madrid")
+    logger.warning(f"Gemini rate limit: retry after {t} Madrid")
 
 
 def _rl_message() -> str:
@@ -86,8 +91,7 @@ def _parse_retry_after(e: Exception) -> int:
     except Exception:
         pass
     try:
-        err_str = str(e)
-        m = re.search(r'retryDelay["\s:]+(\d+)', err_str)
+        m = re.search(r'retryDelay["\s:]+(\d+)', str(e))
         if m:
             return max(int(m.group(1)), 30)
     except Exception:
@@ -108,14 +112,21 @@ def _get_client() -> genai.Client:
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def _make_config(system: str, tokens: int) -> types.GenerateContentConfig:
-    # gemini-3.5-flash принимает ТОЛЬКО: system_instruction, max_output_tokens,
-    # thinking_config, safety_settings — всё остальное даёт 400 INVALID_ARGUMENT
+def _make_config(system: str, tokens: int,
+                 use_search: bool = False,
+                 use_code_exec: bool = False) -> types.GenerateContentConfig:
+    tools = []
+    if use_search:
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
+    if use_code_exec:
+        tools.append(types.Tool(code_execution=types.ToolCodeExecution()))
+
     return types.GenerateContentConfig(
         system_instruction=system,
         max_output_tokens=tokens,
         thinking_config=types.ThinkingConfig(thinking_level="MINIMAL"),
         safety_settings=_SAFETY,
+        tools=tools if tools else None,
     )
 
 
@@ -123,7 +134,9 @@ def _make_config(system: str, tokens: int) -> types.GenerateContentConfig:
 
 async def _call_gemini(prompt,
                        system: str = SYSTEM_PROMPT,
-                       tokens: int = DEFAULT_MAX_TOKENS) -> str | None:
+                       tokens: int = DEFAULT_MAX_TOKENS,
+                       use_search: bool = False,
+                       use_code_exec: bool = False) -> str | None:
     if not GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY не задан")
         return None
@@ -132,7 +145,7 @@ async def _call_gemini(prompt,
         return None
 
     client = _get_client()
-    config = _make_config(system, tokens)
+    config = _make_config(system, tokens, use_search=use_search, use_code_exec=use_code_exec)
 
     for attempt in range(3):
         try:
@@ -146,32 +159,21 @@ async def _call_gemini(prompt,
             err = str(e)
             logger.error(f"ClientError {e.code}: {err[:250]}")
             if e.code == 429 or "resource_exhausted" in err.lower() or "quota" in err.lower():
-                # При любом 429 — сразу ставим rate limit и выходим.
-                # Не делаем retry: если это RPD (дневной лимит), ждать 65с бесполезно.
-                # Если RPM — пользователь просто повторит запрос сам.
-                retry = _parse_retry_after(e)
-                _set_rate_limit(retry)
+                _set_rate_limit(_parse_retry_after(e))
                 return None
-            # 400, 404 и прочие — не retrying
             return None
-
         except ServerError as e:
             logger.error(f"ServerError: {e}")
             if attempt < 2:
                 await asyncio.sleep(5)
             continue
-
         except (aiohttp.ClientConnectorDNSError, aiohttp.ClientError) as e:
             logger.warning(f"Network error: {type(e).__name__}")
             if attempt < 2:
                 await asyncio.sleep(3)
             continue
-
         except Exception as e:
-            try:
-                err = str(e)
-            except Exception:
-                err = repr(e)
+            err = str(e)
             logger.error(f"Unexpected error: {err[:250]}")
             if "429" in err or "resource_exhausted" in err.lower() or "quota" in err.lower():
                 _set_rate_limit(_parse_retry_after(e))
@@ -180,7 +182,6 @@ async def _call_gemini(prompt,
                 await asyncio.sleep(3)
             continue
 
-        # ── Обработка ответа ──────────────────────────────────────────────────
         try:
             text = response.text
         except ValueError:
@@ -189,26 +190,65 @@ async def _call_gemini(prompt,
         if text and text.strip():
             return _strip_markdown(text)
 
-        # Пустой ответ — проверяем причину
         try:
             for c in response.candidates:
                 reason = str(c.finish_reason)
                 logger.warning(f"finish_reason={reason}")
-                # SAFETY / PROHIBITED_CONTENT — не повторяем
                 if any(x in reason.upper() for x in ("SAFETY", "PROHIBITED")):
-                    logger.warning("Blocked by safety filters")
                     return None
         except Exception:
             pass
 
-        # Просто пустой — retry
         if attempt < 2:
             await asyncio.sleep(2)
         continue
 
-    logger.error("All 3 attempts failed")
+    logger.error("All 3 Gemini attempts failed")
     return None
 
+
+# ─── Генерация изображений (Imagen 3) ────────────────────────────────────────
+
+async def generate_image(prompt: str) -> bytes | None:
+    """
+    Генерирует изображение через Imagen 3.
+    Возвращает PNG-байты или None при ошибке.
+    """
+    if not GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY не задан для генерации изображений")
+        return None
+
+    client = _get_client()
+    try:
+        logger.info(f"Imagen request: {prompt[:80]}")
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: client.models.generate_images(
+                model=IMAGEN_MODEL,
+                prompt=prompt,
+                config=types.GenerateImagesConfig(
+                    number_of_images=1,
+                    aspect_ratio="1:1",
+                    safety_filter_level="BLOCK_LOW_AND_ABOVE",
+                    person_generation="ALLOW_ADULT",
+                )
+            )
+        )
+        if response.generated_images:
+            return response.generated_images[0].image.image_bytes
+        logger.warning("Imagen: пустой ответ")
+        return None
+    except ClientError as e:
+        logger.error(f"Imagen ClientError {e.code}: {e}")
+        if e.code == 429:
+            _set_rate_limit(_parse_retry_after(e))
+        return None
+    except Exception as e:
+        logger.error(f"Imagen error: {e}")
+        return None
+
+
+# ─── Транскрипция аудио ───────────────────────────────────────────────────────
 
 async def _call_gemini_audio(audio_bytes: bytes, mime_type: str) -> str | None:
     if _is_rate_limited():
@@ -288,6 +328,30 @@ async def ask_gemini_interactive(prompt: str, system: str = SYSTEM_PROMPT) -> st
     if _is_rate_limited():
         return _rl_message()
     result = await _call_gemini(prompt, system)
+    if result is None:
+        if _is_rate_limited():
+            return _rl_message()
+        return "что-то пошло не так, попробуй ещё раз"
+    return result
+
+
+async def ask_gemini_with_search(prompt: str, system: str = SYSTEM_PROMPT) -> str:
+    """Gemini + Google Search grounding для актуальной информации."""
+    if _is_rate_limited():
+        return _rl_message()
+    result = await _call_gemini(prompt, system, use_search=True)
+    if result is None:
+        if _is_rate_limited():
+            return _rl_message()
+        return "что-то пошло не так, попробуй ещё раз"
+    return result
+
+
+async def ask_gemini_with_code(prompt: str, system: str = SYSTEM_PROMPT) -> str:
+    """Gemini + code execution для решения сложных задач."""
+    if _is_rate_limited():
+        return _rl_message()
+    result = await _call_gemini(prompt, system, use_code_exec=True)
     if result is None:
         if _is_rate_limited():
             return _rl_message()
