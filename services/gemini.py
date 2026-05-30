@@ -152,22 +152,37 @@ def _make_config(model_state: _ModelState,
                  tokens: int) -> types.GenerateContentConfig:
     """
     Создаёт конфиг запроса.
-    Для gemini-3.5-flash добавляет thinking_level=MINIMAL —
-    это отключает скрытое мышление, которое по умолчанию сжигает тысячи TPM.
+
+    Для gemini-3.5-flash (thinking-модель):
+      - temperature, top_p, top_k убраны — Google не рекомендует их для
+        этой архитектуры, они конфликтуют с thinking и могут обрезать вывод
+      - thinking_level=MINIMAL — отключает скрытое мышление, экономит TPM
+
+    Для gemini-2.5-flash (fallback):
+      - стандартные параметры генерации
     """
-    kwargs = dict(
-        system_instruction=system,
-        temperature=temp,
-        top_p=0.95,
-        top_k=40,
-        presence_penalty=0.65,
-        frequency_penalty=0.50,
-        max_output_tokens=tokens,
-        safety_settings=_SAFETY,
-    )
     if model_state.supports_thinking:
-        kwargs['thinking_config'] = _THINKING_MINIMAL
-    return types.GenerateContentConfig(**kwargs)
+        # Thinking-модель: минимум параметров, только thinking + safety + токены
+        return types.GenerateContentConfig(
+            system_instruction=system,
+            max_output_tokens=tokens,
+            presence_penalty=0.65,
+            frequency_penalty=0.50,
+            thinking_config=_THINKING_MINIMAL,
+            safety_settings=_SAFETY,
+        )
+    else:
+        # Обычная модель: полный набор параметров
+        return types.GenerateContentConfig(
+            system_instruction=system,
+            temperature=temp,
+            top_p=0.95,
+            top_k=40,
+            presence_penalty=0.65,
+            frequency_penalty=0.50,
+            max_output_tokens=tokens,
+            safety_settings=_SAFETY,
+        )
 
 
 
