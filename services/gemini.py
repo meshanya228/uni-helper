@@ -146,13 +146,12 @@ async def _call_gemini(prompt,
             err = str(e)
             logger.error(f"ClientError {e.code}: {err[:250]}")
             if e.code == 429 or "resource_exhausted" in err.lower() or "quota" in err.lower():
+                # При любом 429 — сразу ставим rate limit и выходим.
+                # Не делаем retry: если это RPD (дневной лимит), ждать 65с бесполезно.
+                # Если RPM — пользователь просто повторит запрос сам.
                 retry = _parse_retry_after(e)
-                if attempt == 2:
-                    _set_rate_limit(retry)
-                    return None
-                logger.warning(f"429, waiting {retry}s before retry {attempt + 2}/3")
-                await asyncio.sleep(retry)
-                continue
+                _set_rate_limit(retry)
+                return None
             # 400, 404 и прочие — не retrying
             return None
 
@@ -175,12 +174,8 @@ async def _call_gemini(prompt,
                 err = repr(e)
             logger.error(f"Unexpected error: {err[:250]}")
             if "429" in err or "resource_exhausted" in err.lower() or "quota" in err.lower():
-                retry = _parse_retry_after(e)
-                if attempt == 2:
-                    _set_rate_limit(retry)
-                    return None
-                await asyncio.sleep(retry)
-                continue
+                _set_rate_limit(_parse_retry_after(e))
+                return None
             if attempt < 2:
                 await asyncio.sleep(3)
             continue
