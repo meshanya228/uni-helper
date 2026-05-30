@@ -7,7 +7,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import re
 import time
 from dataclasses import dataclass
@@ -29,7 +28,8 @@ GEMINI_MODEL_FALLBACK = "gemini-2.5-flash"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Токены вывода по умолчанию (для summary/profile/audio где нужно много).
-# Для /ai используется dynamic_tokens() — см. ниже.
+# Токены вывода. Кириллица токенизируется в 2-3x хуже латиницы,
+# поэтому нужен большой запас чтобы длинные ответы не обрывались.
 DEFAULT_MAX_TOKENS = 8192
 
 # Safety — всё отключено
@@ -170,29 +170,7 @@ def _make_config(model_state: _ModelState,
     return types.GenerateContentConfig(**kwargs)
 
 
-def dynamic_tokens(prompt: str) -> int:
-    """
-    Рассчитывает лимит токенов исходя из длины промпта.
 
-    Кириллица токенизируется ~2x хуже латиницы, поэтому минимум 60 токенов
-    чтобы даже короткий ответ не обрезался на полуслове.
-
-    Короткая реплика (< 15 симв): «привет», «ха», «как дела»
-      → 60-120 токенов (~90-180 символов) — достаточно для 1-2 фраз
-
-    Средний вопрос (15-80 симв): большинство запросов
-      → 200-500 токенов (~300-750 символов) — 2-5 предложений
-
-    Длинный/сложный запрос (> 80 симв)
-      → 500-900 токенов (~750-1350 символов) — развёрнутый ответ
-    """
-    n = len(prompt)
-    if n < 15:
-        return random.randint(60, 120)
-    elif n < 80:
-        return random.randint(200, 500)
-    else:
-        return random.randint(500, 900)
 
 
 def _strip_markdown(text: str) -> str:
@@ -412,11 +390,10 @@ def ensure_bg_worker():
 
 async def ask_gemini_interactive(prompt: str,
                                   system: str = SYSTEM_PROMPT,
-                                  tokens: int = DEFAULT_MAX_TOKENS,
                                   use_search: bool = False) -> str:
     if _is_all_blocked():
         return _rl_message()
-    result = await _call_gemini(prompt, system, tokens=tokens)
+    result = await _call_gemini(prompt, system)
     if result is None:
         if _is_all_blocked():
             return _rl_message()
