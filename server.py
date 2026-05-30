@@ -14,7 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from handlers.voice    import handle_voice_transcribe
 from handlers.birthday import cmd_birthday, check_birthdays
 from handlers.welcome  import handle_new_member
-from handlers.ai       import (cmd_ai, cmd_summary, cmd_summary_toggle,
+from handlers.ai       import (cmd_ai, cmd_image, cmd_summary, cmd_summary_toggle,
                                 cmd_who, send_auto_summary)
 from handlers.collect  import handle_any_message
 from handlers.links    import cmd_links
@@ -78,7 +78,8 @@ async def cmd_start(update: Update, context):
     text = (
         "Привет! Я UniHelper — бот UAшников 🎓\n\n"
         "Команды:\n"
-        "/ai [вопрос] — спросить у ИИ\n"
+        "/ai [вопрос] — спросить у ИИ (Groq)\n"
+        "/image [описание] — сгенерировать картинку\n"
         "/voice — расшифровать голосовое (ответь на него)\n"
         "/birthday ДД.ММ — сохранить день рождения\n"
         "/summary — сводка за вчера\n"
@@ -126,6 +127,7 @@ async def build_application() -> Application:
     app.add_handler(CommandHandler("voice",         handle_voice_transcribe))
     app.add_handler(CommandHandler("birthday",      cmd_birthday))
     app.add_handler(CommandHandler("ai",            cmd_ai))
+    app.add_handler(CommandHandler("image",         cmd_image))
     app.add_handler(CommandHandler("summary",       cmd_summary))
     app.add_handler(CommandHandler("summarytoggle", cmd_summary_toggle))
     app.add_handler(CommandHandler("who",           cmd_who))
@@ -152,19 +154,25 @@ async def main():
     await init_db()
     ensure_bg_worker()
 
-    # Проверяем Gemini API при старте
     api_status = await check_api_health()
     logger.info(f"Gemini API status: {api_status}")
 
+    # Groq API key check
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    if groq_key:
+        logger.info("Groq API key: ✅ present")
+    else:
+        logger.warning("Groq API key: ❌ GROQ_API_KEY not set")
+
     app = await build_application()
 
-    # Команды с подсказками (hint после команды в поле ввода)
     commands = [
         BotCommand("start",         "Информация о боте"),
         BotCommand("help",          "Справка по командам"),
         BotCommand("voice",         "Расшифровать голосовое (ответь на него)"),
         BotCommand("birthday",      "Сохранить ДР — пример: /birthday 15.03"),
         BotCommand("ai",            "Спросить у ИИ — пример: /ai расскажи анекдот"),
+        BotCommand("image",         "Сгенерировать картинку — пример: /image закат"),
         BotCommand("summary",       "Сводка за вчера"),
         BotCommand("summarytoggle", "Вкл/выкл авто-сводку"),
         BotCommand("who",           "Характеристика — пример: /who @username"),
@@ -174,30 +182,26 @@ async def main():
         BotCommand("map",           "Карта СССР в Аликанте"),
     ]
 
-    # Устанавливаем команды глобально
     await app.bot.set_my_commands(commands)
-    # И отдельно для групп (чтобы /command@botname тоже работало)
     await app.bot.set_my_commands(
         commands, scope=BotCommandScopeAllGroupChats())
 
     scheduler = AsyncIOScheduler(timezone=MADRID_TZ)
-    scheduler.add_job(check_birthdays,              "cron",     hour=0,  minute=0,  args=[app.bot])
-    scheduler.add_job(auto_summary_all,             "cron",     hour=9,  minute=0,  args=[app.bot])
-    scheduler.add_job(cleanup_expired_anon_messages,"interval", hours=1)
-    scheduler.add_job(cleanup_old_gossips,          "cron",     hour=3,  minute=30)
-    scheduler.add_job(self_ping,                    "interval", minutes=10)
+    scheduler.add_job(check_birthdays,               "cron",     hour=0,  minute=0,  args=[app.bot])
+    scheduler.add_job(auto_summary_all,              "cron",     hour=9,  minute=0,  args=[app.bot])
+    scheduler.add_job(cleanup_expired_anon_messages, "interval", hours=1)
+    scheduler.add_job(cleanup_old_gossips,           "cron",     hour=3,  minute=30)
+    scheduler.add_job(self_ping,                     "interval", minutes=10)
     scheduler.start()
 
     await app.initialize()
     await app.start()
 
-    # drop_pending_updates=True — сбрасываем накопившиеся апдейты
-    # чтобы не было конфликта со старой инстанцией
     await app.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True)
 
-    logger.info("UniHelper started ✅")
+    logger.info("UniHelper started ✅ (Groq + Gemini hybrid)")
 
     try:
         await asyncio.Event().wait()
