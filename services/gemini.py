@@ -1,8 +1,7 @@
 """
 Gemini API — официальный SDK google-genai.
-Клиент: genai.Client(api_key=...)
-Основная модель: gemini-3.5-flash
-Fallback: gemini-2.5-flash
+Основная модель: gemini-3.5-flash (thinking=MINIMAL — без скрытых токенов рассуждения)
+Fallback:        gemini-2.5-flash
 """
 import asyncio
 import json
@@ -10,7 +9,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Awaitable
 from zoneinfo import ZoneInfo
@@ -22,11 +21,14 @@ from google.genai.errors import ClientError, ServerError
 logger    = logging.getLogger(__name__)
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
-# ─── Модели с fallback ─────────────────────────────────────────────────────────
+# ─── Модели ───────────────────────────────────────────────────────────────────
 
 GEMINI_MODEL_PRIMARY  = "gemini-3.5-flash"
 GEMINI_MODEL_FALLBACK = "gemini-2.5-flash"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# Токены вывода — 2048 по умолчанию, чтобы ответы не обрывались на середине
+DEFAULT_MAX_TOKENS = 2048
 
 # Safety — всё отключено
 _SAFETY = [
@@ -41,6 +43,10 @@ _SAFETY = [
     types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
                         threshold=types.HarmBlockThreshold.BLOCK_NONE),
 ]
+
+# ThinkingConfig для 3.5-flash — MINIMAL экономит тысячи токенов рассуждения,
+# при этом модель остаётся умной (просто не думает так глубоко перед ответом)
+_THINKING_MINIMAL = types.ThinkingConfig(thinking_level="MINIMAL")
 
 SYSTEM_PROMPT = """Ты — UniHelper, бот в закрытом Telegram-чате «UAшники» — русскоязычные студенты Университета Аликанте, Испания. Примерно 100 человек, все свои.
 
@@ -65,20 +71,21 @@ SYSTEM_PROMPT = """Ты — UniHelper, бот в закрытом Telegram-ча�
 @dataclass
 class _ModelState:
     name: str
-    # Время до которого модель заблокирована из-за 429 (0 = не заблокирована)
+    # Поддерживает ли модель ThinkingConfig
+    supports_thinking: bool = False
+    # До какого времени заблокирована из-за 429
     blocked_until: float = 0.0
     # Последнее время запроса (для throttle)
     last_request: float = 0.0
 
 _models: list[_ModelState] = [
-    _ModelState(GEMINI_MODEL_PRIMARY),
-    _ModelState(GEMINI_MODEL_FALLBACK),
+    _ModelState(GEMINI_MODEL_PRIMARY,  supports_thinking=True),
+    _ModelState(GEMINI_MODEL_FALLBACK, supports_thinking=False),
 ]
 
-# Минимальный интервал между запросами к ОДНОЙ модели (сек)
+# Минимальный интервал между запросами к одной модели (сек)
 _MIN_INTERVAL = 4.0
 
-# Lock чтобы не отправлять к одной модели одновременно
 _model_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -88,24 +95,13 @@ def _get_model_lock(name: str) -> asyncio.Lock:
     return _model_locks[name]
 
 
-def _get_active_model() -> _ModelState | None:
-    """Возвращает первую незаблокированную модель."""
-    now = time.time()
-    for m in _models:
-        if now >= m.blocked_until:
-            return m
-    return None
-
-
 def _block_model(state: _ModelState, seconds: int):
-    """Блокируем модель на N секунд."""
     state.blocked_until = time.time() + seconds
     t = datetime.fromtimestamp(state.blocked_until, tz=MADRID_TZ).strftime('%H:%M')
     logger.warning(f"Model {state.name} blocked until {t} Madrid ({seconds}s)")
 
 
 def _all_blocked_until() -> float:
-    """Возвращает минимальное время когда хоть одна модель освободится."""
     return min(m.blocked_until for m in _models)
 
 
@@ -126,7 +122,6 @@ def reset_rate_limit():
 
 
 def _parse_retry_after(e: Exception) -> int:
-    """Парсим retry-after из ошибки 429."""
     try:
         response = getattr(e, 'response', None)
         if response is not None:
@@ -140,7 +135,7 @@ def _parse_retry_after(e: Exception) -> int:
     m = re.search(r'retryDelay["\s:]+(\d+)', err_str)
     if m:
         return max(int(m.group(1)), 30)
-    return 65  # чуть больше минуты по умолчанию
+    return 65
 
 
 # ─── Клиент ───────────────────────────────────────────────────────────────────
@@ -149,7 +144,27 @@ def _get_client() -> genai.Client:
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-# ─── Базовый запрос ───────────────────────────────────────────────────────────
+def _make_config(model_state: _ModelState,
+                 system: str,
+                 temp: float,
+                 tokens: int) -> types.GenerateContentConfig:
+    """
+    Создаёт конфиг запроса.
+    Для gemini-3.5-flash добавляет thinking_level=MINIMAL —
+    это отключает скрытое мышление, которое по умолчанию сжигает тысячи TPM.
+    """
+    kwargs = dict(
+        system_instruction=system,
+        temperature=temp,
+        max_output_tokens=tokens,
+        safety_settings=_SAFETY,
+    )
+    if model_state.supports_thinking:
+        kwargs['thinking_config'] = _THINKING_MINIMAL
+    return types.GenerateContentConfig(**kwargs)
+
+
+# ─── Один запрос к модели ─────────────────────────────────────────────────────
 
 async def _call_model_once(client: genai.Client,
                             model_state: _ModelState,
@@ -157,11 +172,11 @@ async def _call_model_once(client: genai.Client,
                             config: types.GenerateContentConfig) -> str | None:
     """
     Один запрос к конкретной модели.
-    Возвращает: текст | None (пустой/заблокированный) | raises Exception
+    Возвращает текст или None (пустой ответ / safety block).
+    Исключения пробрасываются наверх.
     """
     lock = _get_model_lock(model_state.name)
     async with lock:
-        # Throttle: выжидаем минимальный интервал
         now = time.time()
         wait = model_state.last_request + _MIN_INTERVAL - now
         if wait > 0:
@@ -179,88 +194,89 @@ async def _call_model_once(client: genai.Client,
         text = response.text
         if text and text.strip():
             return text.strip()
-        # Пустой — проверяем finish_reason
+        # Пустой ответ — проверяем причину
         try:
             for c in response.candidates:
-                if str(c.finish_reason) in ("SAFETY", "2"):
-                    logger.warning(f"  {model_state.name}: blocked by safety")
-                    return None
+                reason = str(c.finish_reason)
+                logger.warning(f"  {model_state.name}: finish_reason={reason}")
+                if reason in ("SAFETY", "2"):
+                    return None  # заблокировано safety — не retrying
         except Exception:
             pass
-        return None  # пустой ответ
-    except ValueError:
+        return None
+    except ValueError as e:
+        logger.warning(f"  {model_state.name}: response.text ValueError: {e}")
         return None
 
+
+# ─── Основной вызов с fallback ────────────────────────────────────────────────
 
 async def _call_gemini(prompt,
                        system: str = SYSTEM_PROMPT,
                        temp: float = 0.9,
-                       tokens: int = 1024) -> str | None:
+                       tokens: int = DEFAULT_MAX_TOKENS) -> str | None:
     """
-    Вызов Gemini с автоматическим fallback между моделями.
-    Каждая модель пробуется 1 раз (если даёт 429 — переходим к следующей).
-    Если все заблокированы — возвращаем None.
+    Вызов Gemini с автоматическим fallback.
+    1. Пробуем gemini-3.5-flash (thinking=MINIMAL)
+    2. Если 429 — автоматически переходим на gemini-2.5-flash
+    3. Если оба недоступны — возвращаем None
     """
     if not GEMINI_API_KEY:
         return None
 
     client = _get_client()
-    config = types.GenerateContentConfig(
-        system_instruction=system,
-        temperature=temp,
-        max_output_tokens=tokens,
-        safety_settings=_SAFETY,
-    )
-
     now = time.time()
 
     for model_state in _models:
-        # Пропускаем заблокированные модели
         if now < model_state.blocked_until:
             remaining = model_state.blocked_until - now
             logger.info(f"Skipping {model_state.name} (blocked {remaining:.0f}s more)")
             continue
 
+        config = _make_config(model_state, system, temp, tokens)
         logger.info(f"Trying model: {model_state.name}")
+
         try:
             result = await _call_model_once(client, model_state, prompt, config)
             if result is not None:
                 return result
-            # Пустой ответ — не блокируем модель, просто продолжаем
-            logger.warning(f"{model_state.name} returned empty response, trying next model")
+            # Пустой ответ — один retry через 2 сек, потом fallback
+            logger.warning(f"{model_state.name}: empty response, retrying once...")
+            await asyncio.sleep(2)
+            result = await _call_model_once(client, model_state, prompt, config)
+            if result is not None:
+                return result
+            logger.warning(f"{model_state.name}: empty again, trying next model")
             continue
 
         except ClientError as e:
             err = str(e)
-            logger.error(f"{model_state.name} ClientError: {e.code} {err[:200]}")
+            logger.error(f"{model_state.name} ClientError {e.code}: {err[:250]}")
 
             if e.code == 429 or "resource_exhausted" in err.lower() or "quota" in err.lower():
                 retry_after = _parse_retry_after(e)
                 _block_model(model_state, retry_after)
                 logger.warning(f"Falling back from {model_state.name} after 429")
-                continue  # пробуем следующую модель
-
-            if e.code == 404 or "not found" in err.lower():
-                logger.error(f"Model {model_state.name} not found — blocking permanently")
-                _block_model(model_state, 86400)  # 24ч
                 continue
 
-            # Другие 4xx — не повторяем
-            logger.error(f"{model_state.name}: unrecoverable error {e.code}")
+            if e.code == 404 or "not found" in err.lower():
+                logger.error(f"Model {model_state.name} not found — blocking 24h")
+                _block_model(model_state, 86400)
+                continue
+
+            # Другие 4xx — не retrying
             return None
 
         except ServerError as e:
             logger.error(f"{model_state.name} ServerError: {e}")
-            # 5xx — ждём немного и пробуем следующую модель
             await asyncio.sleep(2)
             continue
 
         except Exception as e:
             err = str(e)
-            logger.error(f"{model_state.name} unexpected: {err[:200]}")
+            logger.error(f"{model_state.name} unexpected error: {err[:250]}")
             if "429" in err or "resource_exhausted" in err.lower() or "quota" in err.lower():
-                retry_after = _parse_retry_after(e)
-                _block_model(model_state, retry_after)
+                _block_model(model_state, _parse_retry_after(e))
                 continue
             if "404" in err or "not found" in err.lower():
                 _block_model(model_state, 86400)
@@ -274,16 +290,16 @@ async def _call_gemini(prompt,
 
 async def _call_gemini_audio(audio_bytes: bytes, mime_type: str) -> str | None:
     client = _get_client()
-    config = types.GenerateContentConfig(
-        temperature=0.1,
-        max_output_tokens=2048,
-        safety_settings=_SAFETY,
-    )
     audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
     text_part  = "Расшифруй аудио дословно, без цензуры. Только текст, без пояснений."
     for model_state in _models:
         if time.time() < model_state.blocked_until:
             continue
+        config = types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=4096,
+            safety_settings=_SAFETY,
+        )
         try:
             response = await client.aio.models.generate_content(
                 model=model_state.name,
@@ -295,12 +311,13 @@ async def _call_gemini_audio(audio_bytes: bytes, mime_type: str) -> str | None:
             if e.code == 429:
                 _block_model(model_state, _parse_retry_after(e))
                 continue
-            logger.error(f"Audio transcription error ({model_state.name}): {e}")
+            logger.error(f"Audio error ({model_state.name}): {e}")
             return None
         except Exception as e:
-            logger.error(f"Audio transcription error ({model_state.name}): {e}")
+            logger.error(f"Audio error ({model_state.name}): {e}")
             return None
     return None
+
 
 # ─── Фоновая очередь ──────────────────────────────────────────────────────────
 
@@ -310,7 +327,7 @@ class _BgTask:
     system:   str
     callback: Callable[[str], Awaitable[None]]
     temp:     float = 0.9
-    tokens:   int   = 1024
+    tokens:   int   = DEFAULT_MAX_TOKENS
     attempt:  int   = 0
 
 _bg_queue: asyncio.Queue = asyncio.Queue()
@@ -325,7 +342,6 @@ async def _bg_worker():
                 wait = _all_blocked_until() - time.time()
                 if wait > 0:
                     await asyncio.sleep(wait + 1)
-
             result = await _call_gemini(task.prompt, task.system, task.temp, task.tokens)
             if result:
                 await task.callback(result)
@@ -346,6 +362,7 @@ def ensure_bg_worker():
     if _bg_worker_task is None or _bg_worker_task.done():
         loop = asyncio.get_event_loop()
         _bg_worker_task = loop.create_task(_bg_worker())
+
 
 # ─── Публичные функции ────────────────────────────────────────────────────────
 
@@ -408,6 +425,7 @@ async def generate_summary(messages_text: str,
         gossip_block = (f"\n\nДоп инфа (вплети органично, "
                         f"не говори что это сплетни):\n{lines}")
     prompt = f"Лог чата за вчера:\n\n{messages_text}{gossip_block}\n\nНапиши сводку."
+    # Сводка может быть длинной — даём больше токенов
     return await ask_gemini_interactive(prompt, system=system)
 
 
@@ -465,24 +483,22 @@ async def check_api_health() -> str:
     results = []
     client = _get_client()
     for model_state in _models:
+        thinking_note = " [thinking=MINIMAL]" if model_state.supports_thinking else ""
         try:
-            config = types.GenerateContentConfig(
-                system_instruction="Reply with exactly: ok",
-                max_output_tokens=5,
-                temperature=0.1,
-            )
+            config = _make_config(model_state, "Reply with exactly: ok", 0.1, 10)
             resp = await client.aio.models.generate_content(
                 model=model_state.name,
                 contents="hi",
                 config=config,
             )
             text = resp.text.strip() if resp.text else "empty"
-            results.append(f"✅ {model_state.name}: {text}")
+            results.append(f"✅ {model_state.name}{thinking_note}: {text}")
         except ClientError as e:
             if e.code == 429:
                 retry = _parse_retry_after(e)
                 _block_model(model_state, retry)
-                t = datetime.fromtimestamp(model_state.blocked_until, tz=MADRID_TZ).strftime('%H:%M')
+                t = datetime.fromtimestamp(model_state.blocked_until,
+                                           tz=MADRID_TZ).strftime('%H:%M')
                 results.append(f"⚠️ {model_state.name}: rate limit до {t}")
             else:
                 results.append(f"❌ {model_state.name}: {e.code}")
