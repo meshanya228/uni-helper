@@ -163,12 +163,12 @@ def _make_config(model_state: _ModelState,
       - стандартные параметры генерации
     """
     if model_state.supports_thinking:
-        # Thinking-модель: минимум параметров, только thinking + safety + токены
+        # Thinking-модель: только thinking + safety + токены
+        # temperature, top_p, top_k, presence_penalty, frequency_penalty
+        # не поддерживаются gemini-3.5-flash и вызывают 400 INVALID_ARGUMENT
         return types.GenerateContentConfig(
             system_instruction=system,
             max_output_tokens=tokens,
-            presence_penalty=0.65,
-            frequency_penalty=0.50,
             thinking_config=_THINKING_MINIMAL,
             safety_settings=_SAFETY,
         )
